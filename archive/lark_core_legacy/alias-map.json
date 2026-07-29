@@ -1,0 +1,132 @@
+{
+    "柜号/AWB": {
+        "alias": [
+            "Air Waybill",
+            "柜号",
+            "AWB",
+            "Waybill"
+        ],
+        "type": "text"
+    },
+    "MBL": {
+        "alias": [
+            "MBL No.",
+            "MBL #",
+            "Master Bill of Lading"
+        ],
+        "type": "text"
+    },
+    "船司": {
+        "alias": [
+            "Shipper",
+            "船司/航司"
+        ],
+        "type": "multiple_select_single"
+    },
+    "ETD": {
+        "alias": [
+            "Estimated Time of Departure",
+            "开船时间",
+            "启航日期"
+        ],
+        "type": "date"
+    },
+    "到达目的港日期": {
+        "alias": [
+            "Estimated Time of Arrival",
+            "预计到港",
+            "ETA"
+        ],
+        "type": "date"
+    },
+    "柜型": {
+        "alias": [
+            "柜子尺寸",
+            "Dimensions"
+        ],
+        "type": "multiple_select_single"
+    },
+    "目的港": {
+        "alias": [
+            "Destination Port",
+            "到达港"
+        ],
+        "type": "multiple_select_single"
+    },
+    "总箱数": {
+        "alias": [
+            "Total Boxes",
+            "总件数"
+        ],
+        "type": "number"
+    },
+    "体积": {
+        "alias": [
+            "Volume",
+            "CBM",
+            "立方"
+        ],
+        "type": "number"
+    },
+    "重量": {
+        "alias": [
+            "Weight",
+            "毛重",
+            "总毛重"
+        ],
+        "type": "number"
+    },
+    "客户名称": {
+        "alias": [
+            "Customer Name",
+            "客户全称"
+        ],
+        "type": "multiple_select_single"
+    },
+    "客户简称": {
+        "alias": [
+            "Customer Code"
+        ],
+        "type": "text"
+    },
+    "唯一编号": {
+        "alias": [
+            "Forecast ID",
+            "预报编号"
+        ],
+        "type": "text"
+    },
+    "客户批次号": {
+        "alias": [
+            "Cust_ID"
+        ],
+        "type": "text"
+    },
+    "运输方式": {
+        "expression": "row['操作类型'] && row['操作类型'].includes('-') ? row['操作类型'].split('-')[0].trim() : ''",
+        "type": "multiple_select_single"
+    },
+    "业务类型": {
+        "expression": "row['操作类型'] && row['操作类型'].includes('-') ? row['操作类型'].split('-')[1].trim() : (row['操作类型'] || '')",
+        "type": "multiple_select_single"
+    },
+    "预报日期": {
+        "alias": [
+            "Forecast Date",
+            "收到预报日期"
+        ],
+        "type": "date"
+    },
+    "清关进度": {
+        "alias": [
+            "关务状态"
+        ],
+        "type": "multiple_select_single"
+    },
+    "前端备注": {
+        "alias": [
+            "备注"
+        ],
+        "type": "text"
+    }
+}

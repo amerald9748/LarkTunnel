@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(lark-cli --version)",
+      "Bash(node -e ' *)",
+      "Bash(lark-cli auth *)",
+      "Bash(rm -f auth-qr.png)",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\dump_xlsx.py\" \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\7.19���ͼƻ�.xlsx\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\dump_xlsx.py\" \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\7.21���ͼƻ�.xlsx\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" -m py_compile \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\LarkTunnel\\\\webapp\\\\file_parse.py\")",
+      "PowerShell(if \\($?\\) { \"PY_COMPILE_OK\" })",
+      "PowerShell($env:LARK_PORT=\"8787\"; & \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\LarkTunnel\\\\webapp\\\\server.py\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\test_any.py\" \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\7.19���ͼƻ�.xlsx\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\test_any.py\" \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\7.21���ͼƻ�.xlsx\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\test_any.py\" \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\����ƻ�\\(2\\).xlsx\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\perm_audit.py\")",
+      "WebFetch(domain:open.feishu.cn)",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\recon_56.py\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\inspect_testtable.py\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" -m py_compile \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\LarkTunnel\\\\webapp\\\\server.py\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\test_upload.py\")",
+      "PowerShell($env:LARK_PORT=\"8790\"; & \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\LarkTunnel\\\\webapp\\\\server.py\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" -m py_compile \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\LarkTunnel\\\\webapp\\\\upload_56.py\" \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\LarkTunnel\\\\webapp\\\\server.py\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\test_dryrun.py\" \"C:\\\\Users\\\\AAAA\\\\Desktop\\\\����ƻ�\\(2\\).xlsx\" \"BESTAR\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\test_dryrun.py\")",
+      "Bash(cp '/c/Users/AAAA/Desktop/出库计划\\(2\\).xlsx' /c/Users/AAAA/AppData/Local/Temp/claude/C--Users-AAAA-Desktop-LarkTunnel/05d55bb5-a9fb-485a-aade-e37fe1764998/scratchpad/ob2.xlsx)",
+      "Bash(cp /c/Users/AAAA/Desktop/7.19派送计划.xlsx /c/Users/AAAA/AppData/Local/Temp/claude/C--Users-AAAA-Desktop-LarkTunnel/05d55bb5-a9fb-485a-aade-e37fe1764998/scratchpad/p719.xlsx)",
+      "Read(//c/Users/AAAA/AppData/Local/Temp/claude/C--Users-AAAA-Desktop-LarkTunnel/05d55bb5-a9fb-485a-aade-e37fe1764998/scratchpad/**)",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\test_plan.py\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\test_commit_sentinel.py\")",
+      "PowerShell(& \"D:\\\\software\\\\python\\\\python.exe\" \"C:\\\\Users\\\\AAAA\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-AAAA-Desktop-LarkTunnel\\\\05d55bb5-a9fb-485a-aade-e37fe1764998\\\\scratchpad\\\\test_dryrun_ep.py\")"
+    ]
+  }
+}

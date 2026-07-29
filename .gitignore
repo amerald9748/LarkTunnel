@@ -1,0 +1,26 @@
+# Secrets — never commit
+config/secrets.txt
+*.secret
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+
+# Temp payloads written by the client
+lark-payload-*.json
+temp_*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Obsidian workspace cache (keep the notes, ignore local UI state)
+docs/.obsidian/workspace*
+docs/.obsidian/cache
+
+# lark-cli temp payloads
+.tmp/
