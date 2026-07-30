@@ -175,7 +175,11 @@ module.exports = {
   // Workflow tunables
   // ---------------------------------------------------------------------------
   thresholds: {
-    palletDiffWarning: 2, // |provided - estimated| > this => warn
+    palletDiffWarning: 2, // |provided - estimated| > this => warn (node runbook)
+    // Webapp upload guard: |file pallets - 预计板数| > this => BLOCK the row
+    // (no 5.6 create / no trip / no 实际板数 write). Mirrored as
+    // PALLET_DIFF_BLOCK in webapp/upload_56.py.
+    palletDiffBlock: 3,
     tripPalletCap: 28, // trip total pallets > this => warn (overflow)
   },
 };

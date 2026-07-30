@@ -27,13 +27,15 @@ function ctable(tag, items) {
   if (!items || !items.length) return;
   console.table(items.map((it) => {
     const t = it.trip || {};
+    const p = it.pallet || {};
     return {
       柜号: it.awb || "-", ISA: it.isa || "-", 动作: it.action,
       预约记录: it.record_id || "",
       出库计划: (t.do || "-") + (t.table ? `→${t.table}` : ""),
       出库计划记录: t.record_id || "",
-      说明: it.reason || t.note || "",
-      报错: it.error || t.error || "",
+      实际板数: (p.status || "-") + (p.value !== undefined ? `→${p.value}` : ""),
+      说明: it.reason || t.note || p.note || "",
+      报错: it.error || t.error || p.error || "",
     };
   }));
 }
@@ -262,6 +264,7 @@ function renderParsed(r) {
   out.append(row);
 
   renderDetails(out, r.details || []);
+  updateUploadGate();   // no 仓库供应商 chosen yet -> upload/dry-run stay disabled
 }
 
 // Per-container table: each 柜号 with its own 预约号/预约时间, including
@@ -275,10 +278,12 @@ function renderDetails(out, details) {
 
   // ---- 5.6 upload controls (dry-run first) ----
   const controls = el("div", { class: "up56" });
-  const dryBtn = el("button", { class: "primary" }, "预演上传到 5.6（dry-run）");
+  const dryBtn = el("button", { class: "primary", id: "dry56Btn" }, "预演上传到 5.6（dry-run）");
   dryBtn.addEventListener("click", () => dryRun56(dryBtn));
   controls.append(dryBtn, el("span", { class: "up56note" },
-    "按 ISA 去重 · 校验目的地/预约账号 · 预约账号＝上方所选「仓库供应商」"));
+    "按 ISA 去重 · 校验目的地/预约账号 · 预约账号＝上方所选「仓库供应商」"),
+    el("span", { class: "up56gate", id: "whGateNote", hidden: "" },
+      "⚠ 请先选择仓库供应商，再进行上传/预演"));
   out.append(controls);
   out.append(el("div", { id: "manifest56", class: "manifest" }));
 
@@ -311,10 +316,30 @@ function whValue() {
   return s ? s.value : "";
 }
 
+// Gate all upload actions on a chosen 仓库供应商: the per-row 上传 buttons and
+// the 预演 button stay disabled until the dropdown has a value (locked
+// file-derived values count). Buttons that are done or mid-flight are skipped.
+function updateUploadGate() {
+  const ok = !!whValue();
+  const tip = ok ? "" : "请先选择仓库供应商";
+  const dry = $("#dry56Btn");
+  if (dry) { dry.disabled = !ok; dry.title = tip; }
+  document.querySelectorAll("button.mini.up").forEach((b) => {
+    if (b.dataset.done === "1" || b.dataset.busy === "1") return;
+    b.disabled = !ok;
+    b.title = tip;
+  });
+  const note = $("#whGateNote");
+  if (note) note.hidden = ok;
+  if (!ok) clog("上传", "已禁用：请先选择仓库供应商");
+}
+
 // Upload ONE record to 5.6 (guarded). Shows created / skip-exists / block.
 async function uploadRecord(d, btn, stat) {
   if (btn.dataset.done === "1") return;
+  if (!whValue()) { updateUploadGate(); return; }  // gate: need a 仓库供应商
   btn.disabled = true;
+  btn.dataset.busy = "1";
   const prev = btn.textContent;
   btn.textContent = "上传中…";
   stat.className = "upstat";
@@ -328,12 +353,16 @@ async function uploadRecord(d, btn, stat) {
     if (!r.ok) throw new Error(r.error || "上传失败");
     const it = r.item || {};
     const trip = it.trip || {};
+    const pal = it.pallet || {};
+    if (pal.error) cerr("上传", `柜号=${d.awb} 实际板数写入失败:`, pal.error);
+    else if (pal.committed) clog("上传", `柜号=${d.awb} 实际板数已更新为 ${pal.value}`);
     if (it.action === "create" && it.record_id) {
       clog("上传", `完成 柜号=${d.awb}`, `预约记录=${it.record_id}`,
         trip.record_id ? `出库计划记录=${trip.record_id} (${trip.table})` : "无出库计划写入");
       if (trip.error) cerr("上传", `柜号=${d.awb} 出库计划创建失败:`, trip.error);
       btn.dataset.done = "1"; btn.textContent = "已写入"; btn.classList.add("ok");
-      stat.className = "upstat ok"; stat.textContent = "✓ " + it.record_id + tripStat(it);
+      stat.className = "upstat ok";
+      stat.textContent = "✓ " + it.record_id + tripStat(it) + palletStat(it);
     } else if (it.action === "create" && it.error) {
       // 5.6 write itself failed — keep the button usable for a retry
       cerr("上传", `失败 柜号=${d.awb} 写入 5.6 报错:`, it.error);
@@ -352,7 +381,7 @@ async function uploadRecord(d, btn, stat) {
       if (tripErr) { btn.disabled = false; btn.textContent = prev; } // retryable backfill
       else { btn.dataset.done = "1"; btn.textContent = "已存在"; btn.classList.add("skip"); }
       stat.className = tripErr ? "upstat err" : "upstat";
-      stat.textContent = "⏭ 当前派送记录已存在" + tripStat(it);
+      stat.textContent = "⏭ 当前派送记录已存在" + tripStat(it) + palletStat(it);
     } else {
       cerr("上传", `拦截 柜号=${d.awb}:`, it.reason || "已拦截");
       btn.disabled = false; btn.textContent = prev;
@@ -364,13 +393,16 @@ async function uploadRecord(d, btn, stat) {
     btn.disabled = false; btn.textContent = prev;
     stat.className = "upstat err"; stat.textContent = "✗ " + e.message;
   }
+  delete btn.dataset.busy;
+  updateUploadGate();   // re-sync with the current 仓库供应商 selection
 }
 
 // ---- 5.6 dry-run manifest (read-only) + commit ----
 async function dryRun56(btn) {
   if (!state.parse || !(state.parse.details || []).length) return;
-  btn.disabled = true; const prev = btn.textContent; btn.textContent = "预演中…";
   const wh = whValue();
+  if (!wh) { updateUploadGate(); return; }  // gate: need a 仓库供应商
+  btn.disabled = true; const prev = btn.textContent; btn.textContent = "预演中…";
   const mount = $("#manifest56"); mount.innerHTML = "";
   mount.append(el("div", { class: "maninfo" }, el("span", { class: "spinner" }), " 预演中…"));
   clog("预演", "开始", `仓库=${wh || "(未选)"}`, `记录=${state.parse.details.length} 条`);
@@ -387,7 +419,13 @@ async function dryRun56(btn) {
     clog("预演", "完成（未写入）",
       `新建=${s.create} 跳过=${s.skip} 拦截=${s.block}`,
       `出库计划: 新建=${s.trip_create} 补建=${s.trip_backfill}`,
+      `实际板数: 更新=${s.pallet_write} 差异拦截=${s.pallet_block}`,
       `账号=${r.account || "?"}`, `出库计划表=${r.plan_table || "无"}`);
+    (r.items || []).forEach((it) => {
+      const p = it.pallet || {};
+      if (p.status === "blocked")
+        cerr("预演", `柜号=${it.awb} ISA=${it.isa} 已拦截:`, p.note);
+    });
     ctable("预演", r.items);
     renderManifest(mount, r, false);
   } catch (e) {
@@ -395,6 +433,7 @@ async function dryRun56(btn) {
     mount.innerHTML = ""; mount.append(el("div", { class: "maninfo err" }, "⚠ " + e.message));
   } finally {
     btn.disabled = false; btn.textContent = prev;
+    updateUploadGate();   // re-sync with the current 仓库供应商 selection
   }
 }
 
@@ -404,6 +443,14 @@ function tripStat(it) {
   if (t.record_id) return ` · ${t.table || "出库计划"} ✓`;
   if (t.error) return ` · 出库计划创建失败`;
   if (t.do === "linked") return ` · 已关联出库计划`;
+  return "";
+}
+
+// Short 实际板数 status suffix for the single-row upload stat line.
+function palletStat(it) {
+  const p = it.pallet || {};
+  if (p.committed) return ` · 实际板数=${p.value} ✓`;
+  if (p.error) return ` · 实际板数写入失败`;
   return "";
 }
 
@@ -432,13 +479,18 @@ async function commit56(btn) {
     const fail56 = items.filter((it) => it.action === "create" && !it.record_id).length;
     const tripOk = items.filter((it) => (it.trip || {}).record_id).length;
     const tripFail = items.filter((it) => (it.trip || {}).error).length;
-    (fail56 || tripFail ? cerr : clog)("写入", "完成",
+    const palOk = items.filter((it) => (it.pallet || {}).committed).length;
+    const palFail = items.filter((it) => (it.pallet || {}).error).length;
+    (fail56 || tripFail || palFail ? cerr : clog)("写入", "完成",
       `预约: 已写入=${ok56} 失败=${fail56}`,
-      `出库计划(${r.plan_table || "?"}): 已建=${tripOk} 失败=${tripFail}`);
+      `出库计划(${r.plan_table || "?"}): 已建=${tripOk} 失败=${tripFail}`,
+      `实际板数: 已更新=${palOk} 失败=${palFail}`);
     items.forEach((it) => {
       const t = it.trip || {};
+      const p = it.pallet || {};
       if (it.error) cerr("写入", `柜号=${it.awb} ISA=${it.isa} 写入 5.6 失败:`, it.error);
       if (t.error) cerr("写入", `柜号=${it.awb} ISA=${it.isa} 出库计划创建失败:`, t.error);
+      if (p.error) cerr("写入", `柜号=${it.awb} 实际板数写入失败:`, p.error);
     });
     ctable("写入", items);
     renderManifest(mount, r, true);
@@ -464,30 +516,58 @@ function tripCell(it, committed) {
   return el("span", { class: "nullcell", title: t.note || "" }, t.note || "—");
 }
 
+// Chip for the 实际板数 column of the manifest.
+function palletCell(it, committed) {
+  const p = it.pallet || {};
+  if (p.committed) return el("span", { class: "chip ok" }, `✓ ${p.value}`);
+  if (p.error) return el("span", { class: "chip bad", title: p.error }, "写入失败");
+  if (p.status === "blocked")
+    return el("span", { class: "chip bad", title: p.note || "" }, "差异超限");
+  if (p.status === "conflict")
+    return el("span", { class: "chip bad", title: p.note || "" }, "板数冲突");
+  if (p.status === "keep")
+    return el("span", { class: "chip warn", title: p.note || "" }, "保留现值");
+  if (p.status === "dup")
+    return el("span", { class: "chip neu", title: p.note || "" }, "同批合并");
+  if (p.status === "fill" || p.status === "update") {
+    if (committed || it.action === "block")
+      return el("span", { class: "chip neu" }, "未执行");
+    return el("span", { class: "chip " + (p.status === "fill" ? "brand" : "warn"),
+      title: p.note || "" }, `${p.status === "fill" ? "填入" : "更新"} ${p.value}`);
+  }
+  if (p.status === "same") return el("span", { class: "chip neu" }, "已一致");
+  return el("span", { class: "nullcell", title: p.note || "" }, p.note || "—");
+}
+
 function renderManifest(mount, r, committed) {
   mount.innerHTML = "";
   const s = r.summary || { create: 0, skip: 0, block: 0 };
   const acc = r.account ? `预约账号=${r.account}` : `⚠ ${r.account_reason || "预约账号未定"}`;
   const items = r.items || [];
-  let head, tripBits = "", prefix;
+  let head, tripBits = "", palBits = "", prefix;
   if (committed) {
     // report what was actually written, not what was planned
     const ok56 = items.filter((it) => it.record_id).length;
     const fail56 = items.filter((it) => it.action === "create" && !it.record_id).length;
     const tripOk = items.filter((it) => (it.trip || {}).record_id).length;
     const tripFail = items.filter((it) => (it.trip || {}).error).length;
+    const palOk = items.filter((it) => (it.pallet || {}).committed).length;
+    const palFail = items.filter((it) => (it.pallet || {}).error).length;
     head = `已写入 ${ok56}${fail56 ? ` / 失败 ${fail56}` : ""} · 已存在跳过 ${s.skip} · 拦截 ${s.block} · ${acc}`;
     if (tripOk || tripFail) tripBits = ` · 出库计划(${r.plan_table || "?"})：已建 ${tripOk}${tripFail ? ` / 失败 ${tripFail}` : ""}`;
-    prefix = (fail56 || tripFail) ? "⚠ 写入结果：" : "✅ 写入结果：";
+    if (palOk || palFail) palBits = ` · 实际板数：已更新 ${palOk}${palFail ? ` / 失败 ${palFail}` : ""}`;
+    prefix = (fail56 || tripFail || palFail) ? "⚠ 写入结果：" : "✅ 写入结果：";
   } else {
     head = `新建 ${s.create} · 已存在跳过 ${s.skip} · 拦截 ${s.block} · ${acc}`;
     if (s.trip_create || s.trip_backfill)
       tripBits = ` · 出库计划(${r.plan_table || "?"})：新建 ${s.trip_create || 0} / 补建 ${s.trip_backfill || 0}`;
+    if (s.pallet_write || s.pallet_block)
+      palBits = ` · 实际板数：更新 ${s.pallet_write || 0}${s.pallet_block ? ` / 差异拦截 ${s.pallet_block}` : ""}`;
     prefix = "🔎 预演（未写入）：";
   }
-  mount.append(el("div", { class: "maninfo" }, prefix + head + tripBits));
+  mount.append(el("div", { class: "maninfo" }, prefix + head + tripBits + palBits));
 
-  const cols = ["柜号", "路线", "ISA", "时间", "动作", "出库计划", "说明"];
+  const cols = ["柜号", "路线", "ISA", "时间", "动作", "出库计划", "实际板数", "说明"];
   const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c))));
   const tbody = el("tbody");
   for (const it of items) {
@@ -503,20 +583,26 @@ function renderManifest(mount, r, committed) {
       : (it.reason || "") + (it.existing_dest ? `（现${it.existing_dest}）` : "");
     if (it.error) note += (note ? " · " : "") + "写入失败：" + it.error;
     if ((it.trip || {}).error) note += (note ? " · " : "") + "出库计划：" + it.trip.error;
+    const pal = it.pallet || {};
+    if (pal.error) note += (note ? " · " : "") + "实际板数：" + pal.error;
+    else if (pal.status === "conflict" || pal.status === "keep")
+      note += (note ? " · " : "") + pal.note;
     tbody.append(el("tr", {},
       el("td", {}, it.awb || "-"), el("td", {}, it.route || "-"),
       el("td", {}, it.isa || "-"), el("td", {}, it.time || "-"),
       el("td", {}, el("span", { class: "chip " + cls }, label)),
       el("td", {}, tripCell(it, committed)),
+      el("td", {}, palletCell(it, committed)),
       el("td", {}, note)));
   }
   mount.append(el("div", { class: "tablewrap" }, el("table", {}, thead, tbody)));
 
-  if (!committed && (s.create > 0 || s.trip_backfill > 0)) {
+  if (!committed && (s.create > 0 || s.trip_backfill > 0 || s.pallet_write > 0)) {
     const parts = [];
     if (s.create > 0) parts.push(`新建 ${s.create} 条预约`);
     if (s.trip_create > 0) parts.push(`新建 ${s.trip_create} 条出库计划`);
     if (s.trip_backfill > 0) parts.push(`补建 ${s.trip_backfill} 条出库计划`);
+    if (s.pallet_write > 0) parts.push(`更新 ${s.pallet_write} 条实际板数`);
     const cbtn = el("button", { class: "primary commit" }, `确认写入（${parts.join("，")}）`);
     cbtn.addEventListener("click", () => commit56(cbtn));
     mount.append(cbtn);
@@ -557,6 +643,7 @@ function warehouseCard(f, options) {
         m.innerHTML = "";
         m.append(el("div", { class: "maninfo" }, "仓库供应商已更改，请重新预演"));
       }
+      updateUploadGate();   // enable/disable upload buttons to match the choice
     });
     card.append(sel);
     card.append(el("div", { class: "src nullnote" }, "未从文件识别（Null）· 可手动选择"));

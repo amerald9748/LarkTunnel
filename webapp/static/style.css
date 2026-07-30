@@ -62,6 +62,8 @@ button.primary:disabled{opacity:.6; cursor:progress}
 .dropinner .or,.dropinner .fmt{color:var(--muted); font-size:12px}
 .parseout{margin-top:14px}
 .filemeta{font-size:12px; color:var(--muted); margin-bottom:10px}
+.up56gate{font-size:12px; color:var(--warn); font-weight:600}
+button.mini.up:disabled,#dry56Btn:disabled{opacity:.45; cursor:not-allowed}
 /* upload transfer progress */
 .pbar{height:8px; border-radius:6px; background:var(--chip); overflow:hidden; margin:2px 0 12px}
 .pbar-fill{height:100%; width:0; background:var(--brand); border-radius:6px; transition:width .15s ease}

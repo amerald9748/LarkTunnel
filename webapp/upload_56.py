@@ -22,11 +22,24 @@ Delivery-plan interlink (出库计划互联)
   * An appointment that already exists in 5.6 but has NO trip yet (and whose
     预约账号 matches the chosen supplier) gets the missing trip backfilled.
 
+3.1 实际板数 reconciliation (板数校验 + 回写)
+  * Each uploaded row is matched to its 3.1 inventory row by
+    柜号+路线+仓库供应商; the file's pallet count is written into the TEXT
+    column 实际板数. Statuses: fill (empty), update (existing is a plain
+    number and differs), same, keep (existing is non-numeric human text —
+    NEVER overwritten), conflict (two rows target one 3.1 record with
+    different values — both refused), dup (same value, merged to one write).
+  * GUARD: if |file pallets − 预计板数| > PALLET_DIFF_BLOCK the row is
+    BLOCKED, and the block poisons its whole ISA group — a grouped 预约号
+    covering several containers must not be created via a sibling row.
+    Blocked rows write nothing: no 5.6 create, no trip, no pallet write.
+
 `plan()` performs only READS. `commit()` is the sole writer (create records).
 """
 
 import re
 import json
+import math
 import uuid
 import threading
 import lark_client as lark
@@ -60,6 +73,16 @@ LINK_ON_56 = {
     "5.4 VAST-VAN-01": "5.4 出库计划 温哥华",
     "5.5 GFL-VAN-02": "5.5 出库计划-GFL-预约信息",
 }
+
+# ---- 3.1 实际板数 reconciliation -------------------------------------------
+# 上传时把文件里的板数写进 3.1 的实际板数（文本字段，核实于 2026-07-30）。
+# 匹配键 = 柜号/AWB + 目的地路线 + 仓库供应商（同一柜号按路线拆多行）；
+# 柜号精确匹配不到时回退为前缀匹配（拆柜后缀 …A/…B）。
+F31 = {"awb": "柜号/AWB", "warehouse": "仓库供应商", "route": "目的地路线",
+       "actual": "实际板数", "estimated": "预计板数"}
+
+# 文件板数与 3.1 预计板数（公式列）差距超过该值 → 拦截该行上传并报错。
+PALLET_DIFF_BLOCK = 3
 
 
 def fmt_time(appt):
@@ -127,6 +150,133 @@ def _link_ids(v):
     return []
 
 
+def _t31():
+    return lark.config_values()["tables"]["3.1"]
+
+
+def _flat_text(v):
+    """Text out of a search-API field value (segments list / wrapped / plain)."""
+    if isinstance(v, list):
+        return "".join(x.get("text", "") for x in v if isinstance(x, dict)).strip()
+    if isinstance(v, dict):
+        return _flat_text(v.get("value")) if "value" in v else ""
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def _num_of(v):
+    """Number out of a search-API field value ({'type':2,'value':[n]} / text
+    segments / plain). None when not numeric."""
+    if isinstance(v, dict) and "value" in v:
+        v = v["value"]
+    if isinstance(v, list):
+        if v and isinstance(v[0], dict):   # text-segment list -> flatten first
+            v = _flat_text(v)
+        else:
+            v = v[0] if v else None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_n(x):
+    return str(int(x)) if float(x).is_integer() else ("%g" % x)
+
+
+def _find_31(awb, route, warehouse):
+    """3.1 rows for 柜号+路线+仓库. Exact 柜号 first; fall back to a contains
+    search tightened to prefix matches (拆柜后缀 …A/…B). READ."""
+    base, t31 = _base(), _t31()
+
+    def search(op):
+        conds = [
+            {"field_name": F31["awb"], "operator": op, "value": [awb]},
+            {"field_name": F31["warehouse"], "operator": "is", "value": [warehouse]},
+            {"field_name": F31["route"], "operator": "is", "value": [route]},
+        ]
+        return lark._api(
+            "POST", f"/open-apis/bitable/v1/apps/{base}/tables/{t31}/records/search",
+            payload={"filter": {"conjunction": "and", "conditions": conds},
+                     "field_names": [F31["awb"], F31["actual"], F31["estimated"]],
+                     "automatic_fields": False},
+            query={"page_size": 10},
+        ).get("items", [])
+
+    hits = search("is")
+    if not hits:
+        # 拆柜/截断后缀 = 恰好多 1 个字符（…A/…B 或补回的第 8 位数字）。收紧到
+        # 该模式，避免把「MATU…/ZCSU…」这类合并柜号行误当成本柜号的行。
+        pat = re.compile(re.escape(awb) + r"[A-Z0-9]")
+        hits = [h for h in search("contains")
+                if pat.fullmatch(_flat_text((h.get("fields") or {}).get(F31["awb"])))]
+    return hits
+
+
+def _pallet_plan(rec, warehouse, cache):
+    """READ-ONLY decision for one record's 3.1 实际板数:
+    fill / update / same / blocked (diff>PALLET_DIFF_BLOCK) / nomatch /
+    ambiguous / nofile. `blocked` stops the whole row's upload."""
+    awb = str(rec.get("awb") or "").strip()
+    route = str(rec.get("route") or "").strip()
+    raw = rec.get("pallets")
+    out = {"status": None, "note": None}
+    if raw is None or str(raw).strip() == "":
+        out.update(status="nofile", note="文件无板数")
+        return out
+    try:
+        pnum = float(raw)
+    except (TypeError, ValueError):
+        out.update(status="nofile", note=f"板数「{raw}」非数字")
+        return out
+    if not math.isfinite(pnum):   # NaN/inf would slip past the diff guard
+        out.update(status="nofile", note=f"板数「{raw}」不是有效数字")
+        return out
+    out["value"] = _fmt_n(pnum)
+    if not awb or not route:
+        out.update(status="nomatch", note="缺柜号/路线，无法匹配 3.1")
+        return out
+
+    key = (awb, route)
+    if key not in cache:
+        cache[key] = _find_31(awb, route, warehouse)
+    rows = cache[key]
+    if not rows:
+        out.update(status="nomatch", note="3.1 无匹配行")
+        return out
+    if len(rows) > 1:
+        out.update(status="ambiguous", note=f"3.1 匹配 {len(rows)} 行，请手动处理")
+        return out
+
+    f = rows[0].get("fields") or {}
+    est = _num_of(f.get(F31["estimated"]))
+    existing = _flat_text(f.get(F31["actual"]))
+    out.update(record_id=rows[0]["record_id"], estimated=est,
+               existing=existing or None)
+    if est is not None and abs(pnum - est) > PALLET_DIFF_BLOCK:
+        out.update(status="blocked", blocked=True,
+                   note=(f"板数差异过大：文件 {_fmt_n(pnum)} vs 预计板数 "
+                         f"{_fmt_n(est)}（差 {_fmt_n(abs(pnum - est))} > "
+                         f"{PALLET_DIFF_BLOCK}），已阻止上传"))
+        return out
+    if not existing:
+        out.update(status="fill")
+    else:
+        old = _num_of(existing)
+        if (old is not None and old == pnum) or existing == out["value"]:
+            out.update(status="same", note="与现值一致")
+        elif re.fullmatch(r"\d+(?:\.\d+)?", existing):
+            out.update(status="update", note=f"原值 {existing} → {out['value']}")
+        else:
+            # non-numeric human annotation (e.g. "13P-9") — never clobber it
+            out.update(status="keep",
+                       note=f"已有人工值「{existing}」，未覆盖（文件板数 {out['value']}）")
+    if est is None and out["status"] in ("fill", "update"):
+        out["note"] = ((out.get("note") or "") + "（预计板数为空，未校验差异）").strip()
+    return out
+
+
 def plan(records, warehouse):
     """READ-ONLY. Decide, for each record, what would happen in 5.6 AND in the
     supplier's 5.x delivery-plan table.
@@ -145,10 +295,28 @@ def plan(records, warehouse):
             if str(r.get("isa") or "").strip().isdigit()}
     existing = _existing_isas(isas, extra_fields=(link56,) if link56 else ())
 
+    wh_raw = (warehouse or "").strip()
     planned = set()       # ISAs already scheduled to be created in THIS batch
     trip_planned = set()  # ISAs whose trip (new or backfill) is already planned
-    items = []
+    p_cache = {}          # (awb, route) -> 3.1 rows, shared across the batch
+
+    # Pass 1 — pallet reconciliation per row (READ). Skipped when the account
+    # is invalid: every row blocks on the account anyway, and an empty/unknown
+    # warehouse would make the 3.1 search meaningless. A diff-blocked row
+    # poisons its WHOLE ISA group — a grouped 预约号 covers several containers
+    # and must not be created via a sibling row behind the block.
+    pallet_plans = []
+    blocked_isas = {}  # isa -> awb of the row that tripped the guard
     for r in records:
+        isa = str(r.get("isa") or "").strip()
+        p = (_pallet_plan(r, wh_raw, p_cache)
+             if isa.isdigit() and not acc_reason else None)
+        pallet_plans.append(p)
+        if p and p.get("blocked") and isa not in blocked_isas:
+            blocked_isas[isa] = str(r.get("awb") or "?")
+
+    items = []
+    for r, pallet in zip(records, pallet_plans):
         awb = r.get("awb")
         route = r.get("route")
         isa = str(r.get("isa") or "").strip()
@@ -158,8 +326,22 @@ def plan(records, warehouse):
               "exists": False, "trip": {"do": "none"}}
 
         ex = existing.get(isa) or []
+        if pallet is not None:
+            it["pallet"] = pallet
         if not isa.isdigit():
             it["action"], it["reason"] = "block", "无有效预约号(ISA)"
+        elif isa in blocked_isas:
+            # 文件板数 vs 3.1 预计板数 差距超限 -> 整组拦截（不建预约/不建
+            # 出库计划/不写实际板数），包括同预约号下未超限的兄弟行
+            if pallet and pallet.get("blocked"):
+                reason = pallet["note"]
+            else:
+                reason = (f"同预约号(ISA)下柜号 {blocked_isas[isa]} 板数差异"
+                          f"超限，整组已阻止上传")
+            if ex:
+                it["exists"] = True
+                reason += "（该预约已存在，本次不补建出库计划、不更新板数）"
+            it["action"], it["reason"] = "block", reason
         elif ex:
             it["action"], it["reason"], it["exists"] = "skip", "当前派送记录已存在", True
             dests = sorted({lark.display_value("目的地", h["fields"].get("目的地"), None)
@@ -187,8 +369,29 @@ def plan(records, warehouse):
                 it["trip"] = {"do": "none", "note": "该供应商无对应出库计划表"}
         items.append(it)
 
+    # Cross-row consistency: rows that resolve to the SAME 3.1 record must
+    # agree on the pallet value. Conflicts are refused HERE, at plan time —
+    # before anything is written; identical duplicates merge into one write.
+    by_rid = {}
+    for it in items:
+        p = it.get("pallet") or {}
+        if (it["action"] != "block" and p.get("status") in ("fill", "update")
+                and p.get("record_id")):
+            by_rid.setdefault(p["record_id"], []).append(p)
+    for ps in by_rid.values():
+        vals = sorted({p["value"] for p in ps})
+        if len(vals) > 1:
+            for p in ps:
+                p.update(status="conflict",
+                         note=(f"同批对同一 3.1 行给出不同板数（{' / '.join(vals)}），"
+                               f"均未写入，请人工处理"))
+        else:
+            for p in ps[1:]:
+                p.update(status="dup", note="同批重复（同值），合并为一次写入")
+
     summary = {"create": 0, "skip": 0, "block": 0, "exists": 0,
-               "trip_create": 0, "trip_backfill": 0}
+               "trip_create": 0, "trip_backfill": 0,
+               "pallet_write": 0, "pallet_block": 0}
     for it in items:
         summary[it["action"]] += 1
         if it.get("exists"):
@@ -198,6 +401,11 @@ def plan(records, warehouse):
             summary["trip_create"] += 1
         elif do == "backfill":
             summary["trip_backfill"] += 1
+        p = it.get("pallet") or {}
+        if p.get("status") == "blocked":
+            summary["pallet_block"] += 1
+        elif it["action"] != "block" and p.get("status") in ("fill", "update"):
+            summary["pallet_write"] += 1
     return {"items": items, "summary": summary, "account": account,
             "account_reason": acc_reason, "plan_table": plan_table}
 
@@ -263,6 +471,7 @@ def _commit_locked(records, warehouse):
                 it["error"] = str(e)
 
     _commit_trips(result)
+    _commit_pallets(result)
     return result
 
 
@@ -307,3 +516,58 @@ def _commit_trips(result):
         for it, _ in jobs:
             it["trip"]["committed"] = False
             it["trip"]["error"] = str(e)
+
+
+def _commit_pallets(result):
+    """batch_update 3.1 实际板数 for the planned fill/update rows. Never touched:
+    blocked rows, conflict/dup/keep/same rows (plan() marks those), rows whose
+    own 5.6 create failed in this commit, and rows without a 3.1 match."""
+    jobs, primary, dups = [], {}, []
+    for it in result["items"]:
+        p = it.get("pallet") or {}
+        if it.get("action") == "block" or p.get("status") not in ("fill", "update"):
+            continue
+        if it.get("action") == "create" and not it.get("record_id"):
+            continue  # its 5.6 create failed — a rejected row must write nothing
+        rid = p.get("record_id")
+        if not rid:
+            continue
+        prim = primary.get(rid)
+        if prim is not None:
+            if p.get("value") == prim.get("value"):
+                dups.append((p, prim))  # mirror the primary's outcome later
+            else:
+                # plan() refuses conflicts before commit; if one still appears,
+                # withdraw BOTH sides — never write an arbitrary winner
+                if prim in jobs:
+                    jobs.remove(prim)
+                for q in (prim, p):
+                    q["committed"] = False
+                    q["error"] = "同批对同一 3.1 行板数冲突，均未写入"
+            continue
+        primary[rid] = p
+        jobs.append(p)
+
+    if jobs:
+        base, t31 = _base(), _t31()
+        payload = [{"record_id": p["record_id"],
+                    "fields": {F31["actual"]: p["value"]}} for p in jobs]
+        ctoken = _ctoken("pallet", base, t31,
+                         json.dumps({p["record_id"]: p["value"] for p in jobs},
+                                    sort_keys=True))
+        try:
+            lark._api(
+                "POST",
+                f"/open-apis/bitable/v1/apps/{base}/tables/{t31}/records/batch_update",
+                payload={"records": payload}, query={"client_token": ctoken},
+            )
+            for p in jobs:
+                p["committed"] = True
+        except Exception as e:
+            for p in jobs:
+                p["committed"] = False
+                p["error"] = str(e)
+    for p, prim in dups:
+        p["committed"] = prim.get("committed")
+        if prim.get("error"):
+            p["error"] = prim["error"]
