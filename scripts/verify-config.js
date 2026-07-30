@@ -53,7 +53,8 @@ function main() {
   console.log('Table 5.6 (ISA appointments):', config.tables['5.6']);
   const appt = base.tableByLabel('5.6');
   const apF = config.fields.appointment;
-  checkFields(appt, [apF.isa, apF.timestamp, apF.destination, apF.account, apF.deliveryPlanLink]);
+  checkFields(appt, [apF.isa, apF.timestamp, apF.destination, apF.account,
+    ...Object.values(apF.planLinks)]);
   line();
 
   // Delivery-plan tables 5.x

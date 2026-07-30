@@ -38,20 +38,22 @@ and fix in [[Configuration]].
 
 ## Table 5.6 — ISA appointments (`config.fields.appointment`)
 
+All names below confirmed against the live schema 2026-07-29.
+
 | 字段名 | Key | Type | Used for |
 |---|---|---|---|
-| `ISA` **(VERIFY)** | `isa` | text | The ISA appointment number. Search key in 5.6. |
-| `复制时间列` | `timestamp` | datetime | The copy-time value tied to this ISA. |
-| `目的地` **(VERIFY)** | `destination` | text/select | Destination for the appointment. |
+| `ISA` | `isa` | number | The ISA appointment number. Search key in 5.6. |
+| `复制时间列` | `timestamp` | text `YYYY/MM/DD HH:MM` | The copy-time value tied to this ISA. |
+| `目的地` | `destination` | select | Destination for the appointment. |
 | `预约账号` | `account` | select | Appointment account (derived from warehouse). |
-| `配送计划` **(VERIFY)** | `deliveryPlanLink` | link→5.x | The correlated delivery trip. Empty ⇒ ISA not yet tied to a trip. |
+| `5.2 出库计划 卡尔加里` etc. | `planLinks` (map) | two-way link→5.x | ONE back-link field per 5.x plan table (`5.3 出库计划 埃德蒙顿`, `5.4 出库计划 温哥华`, `5.5 出库计划-GFL-预约信息`). There is **no** single `配送计划` field on live 5.6. Empty ⇒ ISA not yet tied to a trip in that table. Auto-fills when the 5.x side (`预约信息`) is written. |
 
 ## Tables 5.x — Delivery plans / trips (`config.fields.deliveryPlan`)
 
 | 字段名 | Key | Type | Used for |
 |---|---|---|---|
-| `总板数` **(VERIFY)** | `totalPallets` | number/rollup | Trip total pallets. Warn if > 28 ([[Production Guardrails]]). |
-| `ISA` **(VERIFY)** | `isaLink` | link→5.6 | Correlates the trip to its ISA appointment. |
-| `库存信息-XXX` **(VERIFY)** | back-link | link→3.1 | Two-way back-link to inventory rows. Label differs per warehouse — see [[Warehouse & Account Map]]. |
+| `预约信息` | `isaLink` | two-way link→5.6 (single) | Correlates the trip to its ISA appointment. Writing this one field interlinks both sides; the 5.x `ISA` / `预约时间` formula columns resolve from it. Confirmed on all four live 5.x tables. |
+| `出库板数` / `出库板数-元浩` / `出库板数-GFL` **(VERIFY name per table)** | `totalPallets` | lookup/formula (read-only) | Trip total pallets. Warn if > 28 ([[Production Guardrails]]). `总板数` does not exist on live 5.x. |
+| `库存信息-XXX` | back-link | two-way link→3.1 | Back-link to inventory rows. Confirmed labels: `库存信息-卡尔加里` (5.2), `库存信息-埃德蒙顿` (5.3), `库存信息-元浩` (5.4), `库存信息-GFL` (5.5). |
 
 Related: [[Table Registry]] · [[Appointment Sync Runbook]]

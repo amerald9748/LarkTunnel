@@ -14,7 +14,8 @@ const el = (tag, attrs = {}, ...kids) => {
   return n;
 };
 
-const state = { tables: [], views: [], fieldKey: "awb", mode: "contains", tz: "", parse: null };
+const state = { tables: [], views: [], fieldKey: "awb", mode: "contains", tz: "",
+  parse: null, commitWarehouse: null, lastPlan: null };
 
 // Columns preferred (in order) for the summary table when present.
 const PREFERRED = ["柜号/AWB", "目的地路线", "仓库供应商", "客户", "客户批次号",
@@ -150,6 +151,8 @@ const FIELD_ORDER = ["awb", "batch", "warehouse", "route", "appointment", "isa"]
 function renderParsed(r) {
   const out = $("#parseOut");
   state.parse = r;                 // keep for dry-run / commit
+  state.commitWarehouse = null;    // new file -> stale dry-run pins are void
+  state.lastPlan = null;
   out.innerHTML = "";
   const sheetTxt = (r.sheets || []).map((s) => `${s.name}(${s.rows}行)`).join("、");
   out.append(el("div", { class: "filemeta" },
@@ -262,11 +265,19 @@ async function uploadRecord(d, btn, stat) {
     const it = r.item || {};
     if (it.action === "create" && it.record_id) {
       btn.dataset.done = "1"; btn.textContent = "已写入"; btn.classList.add("ok");
-      stat.className = "upstat ok"; stat.textContent = "✓ " + it.record_id;
+      stat.className = "upstat ok"; stat.textContent = "✓ " + it.record_id + tripStat(it);
+    } else if (it.action === "create" && it.error) {
+      // 5.6 write itself failed — keep the button usable for a retry
+      btn.disabled = false; btn.textContent = prev;
+      stat.className = "upstat err"; stat.textContent = "✗ 写入失败：" + it.error;
+      stat.title = it.error;
     } else if (it.action === "skip") {
       console.log("当前派送记录已存在");
-      btn.dataset.done = "1"; btn.textContent = "已存在"; btn.classList.add("skip");
-      stat.className = "upstat"; stat.textContent = "⏭ 当前派送记录已存在";
+      const tripErr = (it.trip || {}).error;
+      if (tripErr) { btn.disabled = false; btn.textContent = prev; } // retryable backfill
+      else { btn.dataset.done = "1"; btn.textContent = "已存在"; btn.classList.add("skip"); }
+      stat.className = tripErr ? "upstat err" : "upstat";
+      stat.textContent = "⏭ 当前派送记录已存在" + tripStat(it);
     } else {
       btn.disabled = false; btn.textContent = prev;
       stat.className = "upstat err"; stat.textContent = "⛔ " + (it.reason || "已拦截");
@@ -282,14 +293,17 @@ async function uploadRecord(d, btn, stat) {
 async function dryRun56(btn) {
   if (!state.parse || !(state.parse.details || []).length) return;
   btn.disabled = true; const prev = btn.textContent; btn.textContent = "预演中…";
+  const wh = whValue();
   const mount = $("#manifest56"); mount.innerHTML = "";
   mount.append(el("div", { class: "maninfo" }, el("span", { class: "spinner" }), " 预演中…"));
   try {
     const r = await fetch("/api/dryrun_56", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ records: state.parse.details, warehouse: whValue() }),
+      body: JSON.stringify({ records: state.parse.details, warehouse: wh }),
     }).then((x) => x.json());
     if (!r.ok) throw new Error(r.error || "预演失败");
+    state.commitWarehouse = wh;   // pin what was previewed for the commit step
+    state.lastPlan = r;
     (r.items || []).filter((it) => it.exists).forEach(() => console.log("当前派送记录已存在"));
     renderManifest(mount, r, false);
   } catch (e) {
@@ -299,16 +313,31 @@ async function dryRun56(btn) {
   }
 }
 
+// Short trip status suffix for the single-row upload stat line.
+function tripStat(it) {
+  const t = it.trip || {};
+  if (t.record_id) return ` · ${t.table || "出库计划"} ✓`;
+  if (t.error) return ` · 出库计划创建失败`;
+  if (t.do === "linked") return ` · 已关联出库计划`;
+  return "";
+}
+
 async function commit56(btn) {
   const s = state.parse;
   if (!s) return;
-  if (!confirm("将向飞书「5.6 预约表」真实写入新建的预约记录。已存在的会自动跳过。确认写入？")) return;
+  // Commit writes the warehouse pinned at dry-run time, never the live
+  // dropdown — otherwise a change after the dry-run could silently target a
+  // different account / delivery-plan table than the manifest the user saw.
+  if (state.commitWarehouse == null) { alert("仓库供应商已更改，请先重新预演"); return; }
+  const p = state.lastPlan || {};
+  if (!confirm(`将真实写入：预约账号=${p.account || "?"} · 出库计划表=${p.plan_table || "无"}\n`
+    + "新建预约写入 5.6（已存在自动跳过），并在出库计划表新建/补建关联记录。确认写入？")) return;
   btn.disabled = true; btn.textContent = "写入中…";
   const mount = $("#manifest56");
   try {
     const r = await fetch("/api/commit_56", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ records: s.details, warehouse: whValue() }),
+      body: JSON.stringify({ records: s.details, warehouse: state.commitWarehouse }),
     }).then((x) => x.json());
     if (!r.ok) throw new Error(r.error || "写入失败");
     renderManifest(mount, r, true);
@@ -318,34 +347,75 @@ async function commit56(btn) {
   }
 }
 
+// Chip for the 出库计划 column of the manifest.
+function tripCell(it, committed) {
+  const t = it.trip || {};
+  const tbl = t.table ? t.table.split(" ")[0] : ""; // "5.2 BESTAR-CAL" -> "5.2"
+  if (t.record_id) return el("span", { class: "chip ok" }, `✓ 已建 ${tbl}`);
+  if (t.error) return el("span", { class: "chip bad", title: t.error }, "创建失败");
+  if (t.do === "create" || t.do === "backfill") {
+    if (committed) return el("span", { class: "chip neu" }, "未执行"); // 5.6 create failed upstream
+    return el("span", { class: "chip " + (t.do === "create" ? "brand" : "warn") },
+      `${t.do === "create" ? "新建" : "补建"} → ${tbl}`);
+  }
+  if (t.do === "linked") return el("span", { class: "chip neu" }, "已关联");
+  return el("span", { class: "nullcell", title: t.note || "" }, t.note || "—");
+}
+
 function renderManifest(mount, r, committed) {
   mount.innerHTML = "";
   const s = r.summary || { create: 0, skip: 0, block: 0 };
   const acc = r.account ? `预约账号=${r.account}` : `⚠ ${r.account_reason || "预约账号未定"}`;
-  mount.append(el("div", { class: "maninfo" },
-    (committed ? "✅ 写入结果：" : "🔎 预演（未写入）：") +
-    `新建 ${s.create} · 已存在跳过 ${s.skip} · 拦截 ${s.block} · ${acc}`));
+  const items = r.items || [];
+  let head, tripBits = "", prefix;
+  if (committed) {
+    // report what was actually written, not what was planned
+    const ok56 = items.filter((it) => it.record_id).length;
+    const fail56 = items.filter((it) => it.action === "create" && !it.record_id).length;
+    const tripOk = items.filter((it) => (it.trip || {}).record_id).length;
+    const tripFail = items.filter((it) => (it.trip || {}).error).length;
+    head = `已写入 ${ok56}${fail56 ? ` / 失败 ${fail56}` : ""} · 已存在跳过 ${s.skip} · 拦截 ${s.block} · ${acc}`;
+    if (tripOk || tripFail) tripBits = ` · 出库计划(${r.plan_table || "?"})：已建 ${tripOk}${tripFail ? ` / 失败 ${tripFail}` : ""}`;
+    prefix = (fail56 || tripFail) ? "⚠ 写入结果：" : "✅ 写入结果：";
+  } else {
+    head = `新建 ${s.create} · 已存在跳过 ${s.skip} · 拦截 ${s.block} · ${acc}`;
+    if (s.trip_create || s.trip_backfill)
+      tripBits = ` · 出库计划(${r.plan_table || "?"})：新建 ${s.trip_create || 0} / 补建 ${s.trip_backfill || 0}`;
+    prefix = "🔎 预演（未写入）：";
+  }
+  mount.append(el("div", { class: "maninfo" }, prefix + head + tripBits));
 
-  const cols = ["柜号", "路线", "ISA", "时间", "动作", "说明"];
+  const cols = ["柜号", "路线", "ISA", "时间", "动作", "出库计划", "说明"];
   const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c))));
   const tbody = el("tbody");
-  for (const it of r.items || []) {
+  for (const it of items) {
     let cls = "neu", label = it.action;
-    if (it.action === "create") { cls = committed && it.record_id ? "ok" : "brand"; label = committed && it.record_id ? "已写入" : "待新建"; }
+    if (it.action === "create") {
+      if (committed && it.record_id) { cls = "ok"; label = "已写入"; }
+      else if (committed) { cls = "bad"; label = "失败"; }
+      else { cls = "brand"; label = "待新建"; }
+    }
     else if (it.action === "skip") { cls = "warn"; label = "跳过"; }
     else if (it.action === "block") { cls = "bad"; label = "拦截"; }
-    const note = committed && it.record_id ? ("✓ " + it.record_id)
+    let note = committed && it.record_id ? ("✓ " + it.record_id)
       : (it.reason || "") + (it.existing_dest ? `（现${it.existing_dest}）` : "");
+    if (it.error) note += (note ? " · " : "") + "写入失败：" + it.error;
+    if ((it.trip || {}).error) note += (note ? " · " : "") + "出库计划：" + it.trip.error;
     tbody.append(el("tr", {},
       el("td", {}, it.awb || "-"), el("td", {}, it.route || "-"),
       el("td", {}, it.isa || "-"), el("td", {}, it.time || "-"),
       el("td", {}, el("span", { class: "chip " + cls }, label)),
+      el("td", {}, tripCell(it, committed)),
       el("td", {}, note)));
   }
   mount.append(el("div", { class: "tablewrap" }, el("table", {}, thead, tbody)));
 
-  if (!committed && s.create > 0) {
-    const cbtn = el("button", { class: "primary commit" }, `确认写入 5.6（新建 ${s.create} 条）`);
+  if (!committed && (s.create > 0 || s.trip_backfill > 0)) {
+    const parts = [];
+    if (s.create > 0) parts.push(`新建 ${s.create} 条预约`);
+    if (s.trip_create > 0) parts.push(`新建 ${s.trip_create} 条出库计划`);
+    if (s.trip_backfill > 0) parts.push(`补建 ${s.trip_backfill} 条出库计划`);
+    const cbtn = el("button", { class: "primary commit" }, `确认写入（${parts.join("，")}）`);
     cbtn.addEventListener("click", () => commit56(cbtn));
     mount.append(cbtn);
   }
@@ -376,8 +446,16 @@ function warehouseCard(f, options) {
     sel.disabled = false;          // 是 null -> 可选择
     sel.value = "";
     console.log("Null");           // 要求：仓库供应商为 null 时 console 返回 Null
-    sel.addEventListener("change", () =>
-      console.log("仓库供应商 已选择:", sel.value || "(未选)"));
+    sel.addEventListener("change", () => {
+      console.log("仓库供应商 已选择:", sel.value || "(未选)");
+      // a stale manifest must not be committed against the new warehouse
+      state.commitWarehouse = null;
+      const m = $("#manifest56");
+      if (m && m.innerHTML) {
+        m.innerHTML = "";
+        m.append(el("div", { class: "maninfo" }, "仓库供应商已更改，请重新预演"));
+      }
+    });
     card.append(sel);
     card.append(el("div", { class: "src nullnote" }, "未从文件识别（Null）· 可手动选择"));
   } else {

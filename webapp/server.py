@@ -35,16 +35,6 @@ PARSE_FIELD_LABELS = {
 }
 
 
-# --- Upload target ---------------------------------------------------------
-# For now every "上传" writes ONE text row into the sandbox test table
-# '3.1 测试表'. This is the safest possible destination: it touches no
-# production data table, creates no select options, and is trivially
-# reversible. Re-point UPLOAD_TABLE once the real destination (5.6 / 3.1 /
-# a structured staging table) is decided.
-UPLOAD_TABLE = "tblmAEVldrBdd460"   # 3.1 测试表 (sandbox, single Text field)
-UPLOAD_TABLE_NAME = "3.1 测试表"
-
-
 def _live_options(table_id, field_name):
     """Live select-option names for a field, used to validate parsed values."""
     try:
