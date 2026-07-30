@@ -17,6 +17,27 @@ const el = (tag, attrs = {}, ...kids) => {
 const state = { tables: [], views: [], fieldKey: "awb", mode: "contains", tz: "",
   parse: null, commitWarehouse: null, lastPlan: null };
 
+// ---- console reporting ------------------------------------------------------
+// 任务状态/结果/报错统一实时打进浏览器 console（F12 打开跟踪）。
+const clog = (tag, ...a) => console.log(`[${tag}]`, ...a);
+const cerr = (tag, ...a) => console.error(`[${tag}]`, ...a);
+
+// 预演/写入结果明细表（console.table 一行一条记录）。
+function ctable(tag, items) {
+  if (!items || !items.length) return;
+  console.table(items.map((it) => {
+    const t = it.trip || {};
+    return {
+      柜号: it.awb || "-", ISA: it.isa || "-", 动作: it.action,
+      预约记录: it.record_id || "",
+      出库计划: (t.do || "-") + (t.table ? `→${t.table}` : ""),
+      出库计划记录: t.record_id || "",
+      说明: it.reason || t.note || "",
+      报错: it.error || t.error || "",
+    };
+  }));
+}
+
 // Columns preferred (in order) for the summary table when present.
 const PREFERRED = ["柜号/AWB", "目的地路线", "仓库供应商", "客户", "客户批次号",
   "箱数", "重量", "体积", "预计板数", "实际板数", "总板数", "派送状态",
@@ -126,21 +147,63 @@ function fileToBase64(file) {
   });
 }
 
+// POST JSON with real upload-progress events (fetch cannot report them).
+function postWithProgress(url, bodyObj, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.responseType = "json";
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+    });
+    xhr.onload = () => {
+      if (xhr.status !== 200) return reject(new Error(`HTTP ${xhr.status}`));
+      if (!xhr.response) return reject(new Error("服务器返回了无法解析的内容"));
+      resolve(xhr.response);
+    };
+    xhr.onerror = () => reject(new Error("网络错误，传输中断"));
+    xhr.send(JSON.stringify(bodyObj));
+  });
+}
+
 async function parseFile(file) {
   const out = $("#parseOut");
   out.hidden = false;
   out.innerHTML = "";
-  out.append(el("div", { class: "filemeta" }, el("span", { class: "spinner" }),
-    ` 正在解析 ${file.name} …`));
+  const ptext = el("span", {}, `读取文件 ${file.name} …`);
+  const fill = el("div", { class: "pbar-fill" });
+  out.append(
+    el("div", { class: "filemeta" }, el("span", { class: "spinner" }), " ", ptext),
+    el("div", { class: "pbar" }, fill));
+  const MB = (n) => (n / 1048576).toFixed(2) + " MB";
+  clog("解析", "开始", file.name, `${(file.size / 1024).toFixed(1)} KB`);
+  let lastQ = 0; // last logged quarter (25% steps) — keep console terse
   try {
     const content_b64 = await fileToBase64(file);
-    const r = await fetch("/api/parse", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename: file.name, content_b64, table: $("#tableSel").value }),
-    }).then((x) => x.json());
+    const r = await postWithProgress("/api/parse",
+      { filename: file.name, content_b64, table: $("#tableSel").value },
+      (loaded, total) => {
+        const pct = Math.floor((loaded / total) * 100);
+        fill.style.width = pct + "%";
+        if (loaded >= total) {
+          ptext.textContent = "传输完成 100%，服务器解析中…";
+          fill.classList.add("indet");
+        } else {
+          ptext.textContent = `传输中 ${pct}%（${MB(loaded)} / ${MB(total)}）`;
+        }
+        const q = Math.floor(pct / 25);
+        if (q > lastQ) {
+          lastQ = q;
+          clog("解析", `传输进度 ${Math.min(q * 25, 100)}%（${MB(loaded)} / ${MB(total)}）`);
+        }
+      });
     if (!r.ok) throw new Error(r.error || "解析失败");
+    clog("解析", "完成", r.filename,
+      `明细 ${(r.details || []).length} 条`, "识别字段:", r.fields);
     renderParsed(r);
   } catch (e) {
+    cerr("解析", "失败:", e.message);
     out.innerHTML = "";
     out.append(el("div", { class: "filemeta" }, "⚠ " + e.message));
   }
@@ -256,6 +319,7 @@ async function uploadRecord(d, btn, stat) {
   btn.textContent = "上传中…";
   stat.className = "upstat";
   stat.textContent = "";
+  clog("上传", "开始", `柜号=${d.awb}`, `ISA=${d.isa || "-"}`, `仓库=${whValue() || "(未选)"}`);
   try {
     const r = await fetch("/api/upload", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -263,27 +327,40 @@ async function uploadRecord(d, btn, stat) {
     }).then((x) => x.json());
     if (!r.ok) throw new Error(r.error || "上传失败");
     const it = r.item || {};
+    const trip = it.trip || {};
     if (it.action === "create" && it.record_id) {
+      clog("上传", `完成 柜号=${d.awb}`, `预约记录=${it.record_id}`,
+        trip.record_id ? `出库计划记录=${trip.record_id} (${trip.table})` : "无出库计划写入");
+      if (trip.error) cerr("上传", `柜号=${d.awb} 出库计划创建失败:`, trip.error);
       btn.dataset.done = "1"; btn.textContent = "已写入"; btn.classList.add("ok");
       stat.className = "upstat ok"; stat.textContent = "✓ " + it.record_id + tripStat(it);
     } else if (it.action === "create" && it.error) {
       // 5.6 write itself failed — keep the button usable for a retry
+      cerr("上传", `失败 柜号=${d.awb} 写入 5.6 报错:`, it.error);
       btn.disabled = false; btn.textContent = prev;
       stat.className = "upstat err"; stat.textContent = "✗ 写入失败：" + it.error;
       stat.title = it.error;
     } else if (it.action === "skip") {
       console.log("当前派送记录已存在");
-      const tripErr = (it.trip || {}).error;
+      const tripErr = trip.error;
+      if (trip.record_id)
+        clog("上传", `柜号=${d.awb} 预约已存在，补建出库计划=${trip.record_id} (${trip.table})`);
+      else if (tripErr)
+        cerr("上传", `柜号=${d.awb} 预约已存在，出库计划补建失败:`, tripErr);
+      else
+        clog("上传", `跳过 柜号=${d.awb}`, trip.do === "linked" ? "已关联出库计划" : (trip.note || ""));
       if (tripErr) { btn.disabled = false; btn.textContent = prev; } // retryable backfill
       else { btn.dataset.done = "1"; btn.textContent = "已存在"; btn.classList.add("skip"); }
       stat.className = tripErr ? "upstat err" : "upstat";
       stat.textContent = "⏭ 当前派送记录已存在" + tripStat(it);
     } else {
+      cerr("上传", `拦截 柜号=${d.awb}:`, it.reason || "已拦截");
       btn.disabled = false; btn.textContent = prev;
       stat.className = "upstat err"; stat.textContent = "⛔ " + (it.reason || "已拦截");
       stat.title = it.reason || "";
     }
   } catch (e) {
+    cerr("上传", `失败 柜号=${d.awb}:`, e.message);
     btn.disabled = false; btn.textContent = prev;
     stat.className = "upstat err"; stat.textContent = "✗ " + e.message;
   }
@@ -296,6 +373,7 @@ async function dryRun56(btn) {
   const wh = whValue();
   const mount = $("#manifest56"); mount.innerHTML = "";
   mount.append(el("div", { class: "maninfo" }, el("span", { class: "spinner" }), " 预演中…"));
+  clog("预演", "开始", `仓库=${wh || "(未选)"}`, `记录=${state.parse.details.length} 条`);
   try {
     const r = await fetch("/api/dryrun_56", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -305,8 +383,15 @@ async function dryRun56(btn) {
     state.commitWarehouse = wh;   // pin what was previewed for the commit step
     state.lastPlan = r;
     (r.items || []).filter((it) => it.exists).forEach(() => console.log("当前派送记录已存在"));
+    const s = r.summary || {};
+    clog("预演", "完成（未写入）",
+      `新建=${s.create} 跳过=${s.skip} 拦截=${s.block}`,
+      `出库计划: 新建=${s.trip_create} 补建=${s.trip_backfill}`,
+      `账号=${r.account || "?"}`, `出库计划表=${r.plan_table || "无"}`);
+    ctable("预演", r.items);
     renderManifest(mount, r, false);
   } catch (e) {
+    cerr("预演", "失败:", e.message);
     mount.innerHTML = ""; mount.append(el("div", { class: "maninfo err" }, "⚠ " + e.message));
   } finally {
     btn.disabled = false; btn.textContent = prev;
@@ -334,14 +419,31 @@ async function commit56(btn) {
     + "新建预约写入 5.6（已存在自动跳过），并在出库计划表新建/补建关联记录。确认写入？")) return;
   btn.disabled = true; btn.textContent = "写入中…";
   const mount = $("#manifest56");
+  clog("写入", "开始", `仓库=${state.commitWarehouse}`, `账号=${p.account || "?"}`,
+    `出库计划表=${p.plan_table || "无"}`);
   try {
     const r = await fetch("/api/commit_56", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ records: s.details, warehouse: state.commitWarehouse }),
     }).then((x) => x.json());
     if (!r.ok) throw new Error(r.error || "写入失败");
+    const items = r.items || [];
+    const ok56 = items.filter((it) => it.record_id).length;
+    const fail56 = items.filter((it) => it.action === "create" && !it.record_id).length;
+    const tripOk = items.filter((it) => (it.trip || {}).record_id).length;
+    const tripFail = items.filter((it) => (it.trip || {}).error).length;
+    (fail56 || tripFail ? cerr : clog)("写入", "完成",
+      `预约: 已写入=${ok56} 失败=${fail56}`,
+      `出库计划(${r.plan_table || "?"}): 已建=${tripOk} 失败=${tripFail}`);
+    items.forEach((it) => {
+      const t = it.trip || {};
+      if (it.error) cerr("写入", `柜号=${it.awb} ISA=${it.isa} 写入 5.6 失败:`, it.error);
+      if (t.error) cerr("写入", `柜号=${it.awb} ISA=${it.isa} 出库计划创建失败:`, t.error);
+    });
+    ctable("写入", items);
     renderManifest(mount, r, true);
   } catch (e) {
+    cerr("写入", "失败:", e.message);
     btn.disabled = false; btn.textContent = "确认写入";
     mount.append(el("div", { class: "maninfo err" }, "⚠ 写入失败：" + e.message));
   }
@@ -505,11 +607,14 @@ async function runQuery() {
   btn.disabled = true; btn.textContent = "查询中…";
   setStatus([el("span", {}, el("span", { class: "spinner" }), " 正在从飞书拉取…")], false);
   $("#results").innerHTML = "";
+  clog("查询", "开始", `${state.fieldKey}=${value}`, `模式=${state.mode}`);
   try {
     const r = await fetch("/api/query", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }).then((x) => x.json());
     if (!r.ok) throw new Error(r.error || "查询失败");
+    clog("查询", "完成", `命中 ${r.count} 行（全表 ${r.total_found}）`,
+      r.matched && r.matched.length ? `匹配值: ${r.matched.join(", ")}` : "");
     renderResults(r);
   } catch (e) {
     showError(e.message);
@@ -523,7 +628,7 @@ function setStatus(nodes, isErr) {
   s.hidden = false; s.className = "status" + (isErr ? " err" : "");
   s.innerHTML = ""; nodes.forEach((n) => s.append(n));
 }
-function showError(msg) { setStatus([el("span", {}, "⚠ " + msg)], true); }
+function showError(msg) { cerr("错误", msg); setStatus([el("span", {}, "⚠ " + msg)], true); }
 
 function renderResults(r) {
   const viewName = viewLabel(r.query.view_id);

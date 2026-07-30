@@ -62,6 +62,15 @@ button.primary:disabled{opacity:.6; cursor:progress}
 .dropinner .or,.dropinner .fmt{color:var(--muted); font-size:12px}
 .parseout{margin-top:14px}
 .filemeta{font-size:12px; color:var(--muted); margin-bottom:10px}
+/* upload transfer progress */
+.pbar{height:8px; border-radius:6px; background:var(--chip); overflow:hidden; margin:2px 0 12px}
+.pbar-fill{height:100%; width:0; background:var(--brand); border-radius:6px; transition:width .15s ease}
+.pbar-fill.indet{
+  width:100% !important;
+  background:repeating-linear-gradient(45deg, var(--brand) 0, var(--brand) 10px, #6ea3d8 10px, #6ea3d8 20px);
+  background-size:28px 28px; animation:pbar-move .8s linear infinite;
+}
+@keyframes pbar-move{from{background-position:0 0}to{background-position:28px 0}}
 .fields{display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr)); gap:10px}
 .fcard{border:1px solid var(--line); border-radius:9px; padding:10px 12px; background:#fff}
 .fcard .lbl{font-size:12px; color:var(--muted); font-weight:600; margin-bottom:3px}
