@@ -16,7 +16,6 @@ wrapper library over `lark-cli` and a documented, agent-runnable workflow for th
 | `src/lark/` | Wrapper library — `client.js`, `LarkBase.js`, `LarkTable.js`, `index.js`. |
 | `src/workflow/inputs.example.json` | Template for one appointment session. |
 | `scripts/verify-config.js` | **Read-only** check of config against the live Base. |
-| `webapp/` | **本地查询台** — 输入柜号/ISA，按视图从 3.1 实时拉取。Python，零依赖，只读。见 `webapp/README.md`。 |
 | `docs/` | **Obsidian vault** — open this folder in Obsidian. Start at `00 Home/Home.md`. |
 | `archive/lark_core_legacy/` | Previous forecast/sync project, kept for reference. |
 
@@ -30,14 +29,6 @@ npm run verify:config            # READ-ONLY: confirm tables + field names resol
 
 Then read **`docs/00 Home/Home.md`** and follow
 **`docs/40 Workflows/Appointment Sync Runbook.md`**.
-
-### 只想查一票货？（不需要 Node / lark-cli）
-
-```bash
-python webapp/server.py     # 然后打开 http://127.0.0.1:8787
-```
-
-输入柜号或 ISA、可选视图，直接从 3.1 拉取。只读，详见 `webapp/README.md`。
 
 ## Using the library
 

@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy this file, fill in one appointment session's inputs, and hand it to the agent runbook (see docs/40 Workflows/Appointment Sync Runbook.md). All six fields are required per step 1 of the workflow.",
+
+  "warehouse": "BESTAR",
+  "awb": "093-9992123",
+  "destination": "YYC3",
+  "isa": "ISA-000123",
+  "timestamp": "2026-07-22 14:30:00",
+  "actualPallets": 12,
+
+  "_field_notes": {
+    "warehouse": "仓库供应商 — one of enums.warehouseOptions in config.js",
+    "awb": "柜号/AWB — container / air-waybill code",
+    "destination": "目的地路线 — one of enums.destinationOptions (YEG/YYC/YVR 1-9)",
+    "isa": "ISA appointment number provided this session",
+    "timestamp": "复制时间列 — the copy-time value tied to this ISA in table 5.6",
+    "actualPallets": "实际板数 — the actual pallet count provided this session"
+  }
+}

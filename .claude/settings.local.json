@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(lark-cli --version)",
+      "Bash(node -e ' *)",
+      "Bash(lark-cli auth *)",
+      "Bash(rm -f auth-qr.png)"
+    ]
+  }
+}
