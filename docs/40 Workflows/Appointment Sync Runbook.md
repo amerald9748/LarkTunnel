@@ -183,8 +183,11 @@ Link this 3.1 row to that **existing** trip via the two-way link, unless the tri
 already contains this shipment.
 
 ```js
-  if (isaRec && lark.LarkTable.readLinkIds(isaRec.fields[A.deliveryPlanLink]).length) {
-    const tripId = lark.LarkTable.readLinkIds(isaRec.fields[A.deliveryPlanLink])[0];
+  // 5.6 has ONE back-link field per 5.x plan table (verified live 2026-07-29;
+  // there is no single '配送计划' field). Pick this warehouse's field:
+  const planLink56 = A.planLinks[wh.planTable]; // e.g. '5.2 出库计划 卡尔加里'
+  if (isaRec && lark.LarkTable.readLinkIds(isaRec.fields[planLink56]).length) {
+    const tripId = lark.LarkTable.readLinkIds(isaRec.fields[planLink56])[0];
     // Link from the 3.1 side (populates the 5.x 库存信息-XXX back-link automatically)
     inv.setLink(row.record_id, planLinkField, [tripId]);
     // W3: overflow check
@@ -200,11 +203,12 @@ Create a new trip in 5.x, correlate it to the existing ISA, then link the 3.1 ro
 ```js
   else if (isaRec) {
     const newTrip = planTable.createRecord({
+      // D.isaLink (预约信息) is a TWO-WAY link: creating the trip with it set
+      // auto-fills the 5.6 back-link (A.planLinks[wh.planTable]) — no extra
+      // appt.setLink call needed.
       [D.isaLink]: [isaRec.record_id],
       [cfgBackLink(wh)]: [row.record_id],   // two-way link to 3.1 (库存信息-XXX)
     });
-    // Also set the ISA's plan link + the 3.1 plan link (two-way keeps sides in sync)
-    appt.setLink(isaRec.record_id, A.deliveryPlanLink, [newTrip.record_id]);
     inv.setLink(row.record_id, planLinkField, [newTrip.record_id]);
   }
 ```
@@ -222,10 +226,9 @@ Create the ISA in 5.6 (from `isa` + `destination` + `timestamp` + the warehouse'
       [A.account]:     wh.account,          // BESTAR / WBLL / VAST / GFL
     });
     const newTrip = planTable.createRecord({
-      [D.isaLink]:     [newIsa.record_id],
+      [D.isaLink]:     [newIsa.record_id],  // two-way: 5.6 side auto-fills
       [cfgBackLink(wh)]: [row.record_id],
     });
-    appt.setLink(newIsa.record_id, A.deliveryPlanLink, [newTrip.record_id]);
     inv.setLink(row.record_id, planLinkField, [newTrip.record_id]);
   }
 }
@@ -258,8 +261,11 @@ console.log(warnings.length ? warnings.join('\n') : 'No warnings.');
 - [ ] Warnings reported?
 
 > [!warning] Known field-name uncertainty
-> Steps 4A/4B depend on `VERIFY`-flagged fields in 5.6 and 5.x
-> (`ISA`, `复制时间列`, `配送计划`, `总板数`, `库存信息-XXX`). Confirm them before
-> trusting the branch logic. See [[Field Glossary]].
+> Most 5.6/5.x field names were confirmed against the live schema 2026-07-29
+> (`ISA`, `复制时间列`, `预约信息`, the per-warehouse 5.6 plan links, and the
+> `库存信息-XXX` back-links — see [[Field Glossary]]). Still unresolved:
+> `总板数` does not exist on live 5.x — the pallet total is the read-only
+> `出库板数` (5.2/5.3) / `出库板数-元浩` (5.4) / `出库板数-GFL` (5.5) column, so
+> the W3 overflow check must read those instead.
 
 Related: [[Decision Tree]] · [[Wrapper Library]] · [[Production Guardrails]] · [[Agent System Prompt]]

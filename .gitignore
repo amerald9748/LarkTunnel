@@ -6,6 +6,13 @@ config/secrets.txt
 node_modules/
 npm-debug.log*
 
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+
 # Temp payloads written by the client
 lark-payload-*.json
 temp_*.json

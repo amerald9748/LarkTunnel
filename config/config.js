@@ -70,20 +70,33 @@ module.exports = {
       // are FORMULA fields (type 20) — read-only, resolved via the link fields.
     },
 
-    // 5.6 ISA appointment table
+    // 5.6 ISA appointment table (all names confirmed against live schema 2026-07-29)
     appointment: {
-      isa: 'ISA', // VERIFY exact column name (ISA / ISA# / ISA号)
-      timestamp: '复制时间列', // the copy-time column
-      destination: '目的地', // VERIFY
-      account: '预约账号', // appointment account
-      // Link on 5.6 pointing to the correlated delivery trip (in a 5.x table).
-      deliveryPlanLink: '配送计划', // VERIFY exact column name
+      isa: 'ISA', // Number field
+      timestamp: '复制时间列', // Text; stored as 'YYYY/MM/DD HH:MM'
+      destination: '目的地', // SingleSelect
+      account: '预约账号', // SingleSelect
+      // Two-way link fields on 5.6, ONE PER 5.x delivery-plan table (there is
+      // NO single '配送计划' field on live 5.6). Keyed by plan-table label.
+      planLinks: {
+        '5.2 BESTAR-CAL': '5.2 出库计划 卡尔加里',
+        '5.3 WBLL-EDM': '5.3 出库计划 埃德蒙顿',
+        '5.4 VAST-VAN-01': '5.4 出库计划 温哥华',
+        '5.5 GFL-VAN-02': '5.5 出库计划-GFL-预约信息',
+      },
     },
 
     // 5.x delivery-plan tables (shared shape; back-link name differs per table)
     deliveryPlan: {
-      totalPallets: '总板数', // VERIFY — used for the >28 overflow warning
-      isaLink: 'ISA', // VERIFY — link back to the 5.6 appointment
+      // Two-way link back to the 5.6 appointment (single-value). Confirmed on
+      // all four live 5.x tables 2026-07-29. Writing this one field is enough:
+      // the 5.6 side (fields.appointment.planLinks) auto-fills, and the 5.x
+      // ISA / 预约时间 formula columns resolve from the link.
+      isaLink: '预约信息',
+      // VERIFY — '总板数' does not exist on live 5.x tables; the pallet total
+      // is '出库板数' (5.2/5.3) / '出库板数-元浩' (5.4) / '出库板数-GFL' (5.5),
+      // all read-only Lookup/Formula columns. Overflow check must read those.
+      totalPallets: '总板数',
       // Two-way back-link field pointing to 3.1 inventory rows. The label
       // differs per warehouse table (e.g. "库存信息-卡尔加里"). Declared per
       // warehouse in `warehouses[].inventoryBackLinkField`.
@@ -119,14 +132,14 @@ module.exports = {
       accountAlias: '元浩',
       planTable: '5.4 VAST-VAN-01',
       planLinkField: '5.4 VAST-VAN-01',
-      inventoryBackLinkField: '库存信息-温哥华', // VERIFY (Vancouver)
+      inventoryBackLinkField: '库存信息-元浩', // confirmed live 2026-07-29
       region: 'VAN',
     },
     GFL: {
       account: 'GFL',
       planTable: '5.5 GFL-VAN-02',
       planLinkField: '5.5 GFL-VAN-02',
-      inventoryBackLinkField: '库存信息-温哥华GFL', // VERIFY (Vancouver)
+      inventoryBackLinkField: '库存信息-GFL', // confirmed live 2026-07-29
       region: 'VAN',
     },
     // CAL-5505 routes through BESTAR (confirmed by user 2026-07-22).
@@ -162,7 +175,11 @@ module.exports = {
   // Workflow tunables
   // ---------------------------------------------------------------------------
   thresholds: {
-    palletDiffWarning: 2, // |provided - estimated| > this => warn
+    palletDiffWarning: 2, // |provided - estimated| > this => warn (node runbook)
+    // Webapp upload guard: |file pallets - 预计板数| > this => BLOCK the row
+    // (no 5.6 create / no trip / no 实际板数 write). Mirrored as
+    // PALLET_DIFF_BLOCK in webapp/upload_56.py.
+    palletDiffBlock: 3,
     tripPalletCap: 28, // trip total pallets > this => warn (overflow)
   },
 };
