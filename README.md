@@ -16,6 +16,7 @@ wrapper library over `lark-cli` and a documented, agent-runnable workflow for th
 | `src/lark/` | Wrapper library — `client.js`, `LarkBase.js`, `LarkTable.js`, `index.js`. |
 | `src/workflow/inputs.example.json` | Template for one appointment session. |
 | `scripts/verify-config.js` | **Read-only** check of config against the live Base. |
+| `webapp/` | **到仓核对台** — 预约同步（批量粘贴→预检→勾选执行）+ 柜号/ISA 查询 + 文件上传。Python 零依赖。见 `webapp/README.md`。 |
 | `docs/` | **Obsidian vault** — open this folder in Obsidian. Start at `00 Home/Home.md`. |
 | `archive/lark_core_legacy/` | Previous forecast/sync project, kept for reference. |
 
@@ -29,6 +30,17 @@ npm run verify:config            # READ-ONLY: confirm tables + field names resol
 
 Then read **`docs/00 Home/Home.md`** and follow
 **`docs/40 Workflows/Appointment Sync Runbook.md`**.
+
+### 到仓核对 / 预约同步（webapp，不需要 Node / lark-cli）
+
+```bash
+python webapp/server.py     # 生产 · http://127.0.0.1:8787
+webapp\run-dev.bat          # 测试环境（dev 副本表）· http://127.0.0.1:8788
+```
+
+粘贴到仓明细（柜号/路线/板数/箱数 + 可选 ISA/时间），逐行预检 3.1/5.6/出库
+计划，人工勾选后一键执行。只读预检、显式提交、写后回读核实。详见
+`webapp/README.md`。
 
 ## Using the library
 

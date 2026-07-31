@@ -53,14 +53,34 @@ function statusChipClass(v) {
   return "neu";
 }
 
+// ---- tabs -------------------------------------------------------------------
+function initTabs() {
+  $("#tabs").addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    [...$("#tabs").children].forEach((x) => x.classList.toggle("on", x === b));
+    for (const pane of document.querySelectorAll(".tabpane"))
+      pane.hidden = pane.id !== "tab-" + b.dataset.tab;
+  });
+}
+function switchTab(name) {
+  const b = [...$("#tabs").children].find((x) => x.dataset.tab === name);
+  if (b) b.click();
+}
+
 // ---- bootstrap ------------------------------------------------------------
 async function boot() {
+  initTabs();
+  bootSync();
   try {
     const r = await fetch("/api/tables").then((x) => x.json());
     if (!r.ok) throw new Error(r.error || "加载表失败");
     state.tables = r.tables;
     state.tz = r.tz;
     $("#tzNote").textContent = "时间显示时区 " + r.tz;
+    const badge = $("#envBadge");
+    badge.hidden = false;
+    badge.textContent = r.env === "dev" ? "DEV 测试环境" : "PROD 生产";
+    badge.className = "envbadge " + (r.env === "dev" ? "dev" : "prod");
     const sel = $("#tableSel");
     sel.innerHTML = "";
     for (const t of r.tables) sel.append(el("option", { value: t.id }, `${t.label}`));
@@ -657,6 +677,7 @@ function warehouseCard(f, options) {
 }
 
 function useParsed(kind, value) {
+  switchTab("query");   // 上传页的「查询」按钮跳到查询页执行
   [...$("#fieldSeg").children].find((b) => b.dataset.k === kind).click();
   $("#valInput").value = value;
   runQuery();
@@ -796,5 +817,551 @@ function viewLabel(id) {
   return v ? v.view_name : id;
 }
 function clip(s) { s = String(s); return s.length > 60 ? s.slice(0, 58) + "…" : s; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ⚡ 预约同步 (appointment sync) — batch paste -> READ-ONLY plan -> explicit
+   execute. Client-side validation mirrors webapp/appointment_sync.parse_line
+   for INSTANT feedback; the server re-validates authoritatively.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const sync = { meta: null, warehouse: null, plan: null, busy: false };
+
+const RE_DEST = /^(YEG|YYC|YVR)[1-9]$/;
+const RE_ISA = /^\d{8,15}$/;
+const RE_TIME = /^(\d{1,4})[/-](\d{1,2})[/-](\d{1,4})\s+\d{1,2}:\d{2}$/;
+
+// Mirror of parse_line(): returns {ok, msg} per line — same rejection rules.
+function checkLine(raw) {
+  const line = raw.replace(/ |　/g, " ").trim();
+  if (!line) return null;                       // blank lines are skipped
+  if (raw.includes("\t")) {
+    const cells = raw.split("\t").map((c) => c.trim());
+    while (cells.length && cells[cells.length - 1] === "") cells.pop();
+    if (cells.includes(""))
+      return { ok: false, msg: "存在空列 — 最后两列必须是 [实际板数] [箱数]" };
+  }
+  const t = line.split(/\s+/);
+  if (t.length < 4) return { ok: false, msg: `只有 ${t.length} 列，需要 [柜号] [路线] [板数] [箱数]` };
+  if (t.length === 5 || t.length === 6 || t.length > 8)
+    return { ok: false, msg: "带预约时格式应为 [柜号] [路线] [板数] [箱数] [ISA] [日期] [时间] [时区可选]" };
+  if (!RE_DEST.test(t[1].toUpperCase()))
+    return { ok: false, msg: `路线「${t[1]}」不合法（YEG/YYC/YVR + 1-9）` };
+  if (!/^\d+$/.test(t[2]) || !/^\d+$/.test(t[3]))
+    return { ok: false, msg: "最后两列必须是 [实际板数] [箱数] 两个数字" };
+  if (t[2].length >= 9 || t[3].length >= 9)
+    return { ok: false, msg: "疑似 ISA 出现在板数/箱数位置 — 板数或箱数缺失？" };
+  if (+t[2] < 1 || +t[2] > 99) return { ok: false, msg: `实际板数 ${t[2]} 超出 1-99` };
+  if (t.length >= 7) {
+    if (!RE_ISA.test(t[4])) return { ok: false, msg: `ISA「${t[4]}」应为 8-15 位数字` };
+    if (!RE_TIME.test(t[5] + " " + t[6]))
+      return { ok: false, msg: `预约时间「${t[5]} ${t[6]}」应为 MM/DD/YYYY HH:MM` };
+    if (t.length === 8 && !/^[A-Z]{2,4}$/i.test(t[7]))
+      return { ok: false, msg: `时区「${t[7]}」无法识别` };
+    return { ok: true, msg: `✓ ${t[0]} → ${t[1].toUpperCase()} · ${t[2]}板 ${t[3]}箱 · ISA ${t[4]} @ ${t[5]} ${t[6]}${t[7] ? " " + t[7] : ""}` };
+  }
+  return { ok: true, msg: `✓ ${t[0]} → ${t[1].toUpperCase()} · ${t[2]}板 ${t[3]}箱（无预约信息 — 仅核对）` };
+}
+
+async function bootSync() {
+  try {
+    const r = await fetch("/api/sync/meta").then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "加载失败");
+    sync.meta = r;
+    const seg = $("#whSeg");
+    seg.innerHTML = "";
+    for (const w of r.warehouses) {
+      const note = !w.mapped ? "未配置预约流程（仅查询+板数核对）"
+        : !w.trip_enabled ? `DEV 环境无 ${w.plan_table} 副本 — 预约/行程停用（仅板数核对）`
+        : `预约账号 ${w.account} · ${w.plan_table}`;
+      const b = el("button", { "data-w": w.key, title: note },
+        w.label + (w.mapped && w.trip_enabled ? "" : " ⚠"));
+      seg.append(b);
+    }
+    seg.addEventListener("click", (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      sync.warehouse = b.dataset.w;
+      [...seg.children].forEach((x) => x.classList.toggle("on", x === b));
+      const w = r.warehouses.find((x) => x.key === sync.warehouse);
+      $("#whTip").textContent = !w.mapped
+        ? "⚠ 该仓库未配置预约账号/出库计划表 — 本次仅执行 3.1 查询与实际板数核对"
+        : !w.trip_enabled
+        ? `⚠ DEV 环境无「${w.plan_table}」副本表 — 预约/行程操作停用，仅板数核对（复制该表后可启用）`
+        : `预约账号：${w.account} · 出库计划表：${w.plan_table}`;
+      gateSyncPlan();
+    });
+  } catch (e) {
+    $("#whTip").textContent = "⚠ " + e.message;
+  }
+  const ta = $("#syncInput");
+  ta.addEventListener("input", () => { renderLineChecks(); gateSyncPlan(); });
+  // Tab key inserts a real \t (matching Excel-pasted rows) instead of moving focus.
+  ta.addEventListener("keydown", (e) => {
+    if (e.key !== "Tab") return;
+    e.preventDefault();
+    const [s, epos] = [ta.selectionStart, ta.selectionEnd];
+    ta.value = ta.value.slice(0, s) + "\t" + ta.value.slice(epos);
+    ta.selectionStart = ta.selectionEnd = s + 1;
+    renderLineChecks(); gateSyncPlan();
+  });
+  $("#syncPlanBtn").addEventListener("click", planSync);
+  $("#syncExecBtn").addEventListener("click", execSync);
+  $("#chkAll").addEventListener("change", (e) => {
+    document.querySelectorAll("#syncResults input.rowchk:not(:disabled)")
+      .forEach((c) => { c.checked = e.target.checked; });
+    updateExecCount();
+  });
+  reattachJob();   // resume a job that was running when the page reloaded
+}
+
+function lineChecks() {
+  return $("#syncInput").value.split("\n")
+    .map((raw, i) => ({ n: i + 1, raw, res: checkLine(raw) }))
+    .filter((x) => x.res !== null);
+}
+
+function renderLineChecks() {
+  const mount = $("#syncLines");
+  mount.innerHTML = "";
+  for (const { n, res } of lineChecks()) {
+    mount.append(el("div", { class: "linechk " + (res.ok ? "ok" : "bad") },
+      el("span", { class: "ln" }, "第" + n + "行"), res.msg));
+  }
+}
+
+// 查询按钮门槛：已选仓库 + 至少一行 + 所有行通过校验（按规范：格式修好前不处理）。
+function gateSyncPlan() {
+  const checks = lineChecks();
+  const bad = checks.filter((c) => !c.res.ok).length;
+  const ok = !!sync.warehouse && checks.length > 0 && bad === 0 && !sync.busy;
+  $("#syncPlanBtn").disabled = !ok;
+  $("#syncGoTip").textContent = !sync.warehouse ? "请先选择仓库供应商"
+    : checks.length === 0 ? "请粘贴到仓明细"
+    : bad ? `有 ${bad} 行格式错误 — 修正或删除后才能查询` : "只读预检，不写入任何数据";
+}
+
+/* ---- job polling & progress panel ----------------------------------------
+   plan/commit run as SERVER-SIDE background jobs (they are long chains of
+   Feishu calls). The POST returns a job id immediately; we poll ~2×/s for
+   {stage, done/total, current row, elapsed} so the operator always sees that
+   — and what — is running. Poll failures don't kill the job: we keep trying
+   and say so. */
+const POLL_MS = 500;
+
+function showProgress(kind) {
+  $("#syncProgress").hidden = false;
+  $("#progStage").textContent = kind === "commit" ? "提交写入任务…" : "启动预检…";
+  $("#progCount").textContent = "";
+  $("#progElapsed").textContent = "";
+  $("#progCurrent").textContent = "";
+  $("#progFill").style.width = "0%";
+  $("#progFill").classList.add("indet");
+}
+
+function updateProgress(job, netTrouble) {
+  $("#progStage").textContent = job.stage || "…";
+  const { done, total } = job;
+  if (total > 0) {
+    $("#progFill").classList.remove("indet");
+    $("#progFill").style.width = Math.round((done / total) * 100) + "%";
+    $("#progCount").textContent = `${done} / ${total} 行`;
+  } else {
+    $("#progFill").classList.add("indet");   // batch write phases: no row count
+    $("#progCount").textContent = "";
+  }
+  $("#progElapsed").textContent = `已用 ${Math.round(job.elapsed)} 秒`;
+  $("#progCurrent").textContent = netTrouble
+    ? "⚠ 服务器暂时无响应，继续重试中…（任务仍在服务端运行）"
+    : (job.current || "");
+}
+
+function hideProgress() { $("#syncProgress").hidden = true; }
+
+// Poll until the job reaches a terminal state. Tolerates transient poll
+// failures (server busy / brief network blips) — the job itself is unaffected.
+async function pollJob(jobId, kind) {
+  let failures = 0;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, POLL_MS));
+    let r;
+    try {
+      r = await fetch("/api/sync/job?id=" + encodeURIComponent(jobId))
+        .then((x) => x.json());
+      if (!r.ok) throw new Error(r.error || "poll failed");
+      failures = 0;
+    } catch (e) {
+      failures++;
+      if (failures >= 120)   // ~1 min of continuous failure: give up the WAIT
+        throw new Error("与服务器失去联系超过 1 分钟 — 任务可能仍在执行，"
+          + "请稍后刷新页面查看结果");
+      updateProgress({ stage: "连接中断，重试…", done: 0, total: 0,
+        elapsed: 0, current: "" }, true);
+      continue;
+    }
+    const job = r.job;
+    updateProgress(job, false);
+    if (job.state === "done") return job;
+    if (job.state === "error") throw new Error(job.error || "任务失败");
+  }
+}
+
+function rememberJob(id, kind) { sessionStorage.setItem("larkSyncJob", JSON.stringify({ id, kind })); }
+function forgetJob() { sessionStorage.removeItem("larkSyncJob"); }
+
+function renderPlanOutcome(r) {
+  sync.plan = r;
+  const s = r.summary;
+  clog("预检", "完成（只读）", `行=${s.lines} 可执行=${s.actionable} 警告=${s.warnings} 拦截=${s.blocked}`);
+  setSyncStatus([
+    el("span", { class: "pill" }, "共 ", el("b", {}, String(s.lines)), " 行"),
+    el("span", { class: "pill" }, "可执行 ", el("b", {}, String(s.actionable))),
+    el("span", { class: "pill" + (s.warnings ? " warnpill" : "") }, `⚠ 警告 ${s.warnings}`),
+    el("span", { class: "pill" + (s.blocked || s.match_errors || s.parse_errors ? " warnpill" : "") },
+      `⛔ 拦截/错误 ${s.blocked + s.match_errors + s.parse_errors}`),
+    el("span", { class: "pill" }, `账号 ${r.account || "—"} · 计划表 ${r.plan_table || "—"} · 环境 ${r.env.toUpperCase()}`),
+  ]);
+  renderSyncRows(r, false);
+}
+
+async function planSync() {
+  const btn = $("#syncPlanBtn");
+  sync.busy = true; btn.disabled = true; btn.textContent = "查询中…";
+  $("#execBar").hidden = true;
+  $("#syncWarnings").hidden = true;
+  $("#syncResults").innerHTML = "";
+  $("#syncStatus").hidden = true;
+  showProgress("plan");
+  clog("预检", "开始", `仓库=${sync.warehouse}`);
+  try {
+    const r = await fetch("/api/sync/plan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ warehouse: sync.warehouse, text: $("#syncInput").value }),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "预检失败");
+    rememberJob(r.job.id, "plan");
+    const job = await pollJob(r.job.id, "plan");
+    forgetJob();
+    hideProgress();
+    renderPlanOutcome(job.result);
+  } catch (e) {
+    hideProgress();
+    cerr("预检", "失败:", e.message);
+    setSyncStatus([el("span", {}, "⚠ " + e.message)], true);
+  } finally {
+    sync.busy = false; btn.textContent = "查询并预检（只读）"; gateSyncPlan();
+  }
+}
+
+function setSyncStatus(nodes, isErr) {
+  const s = $("#syncStatus");
+  s.hidden = false; s.className = "status" + (isErr ? " err" : "");
+  s.innerHTML = ""; nodes.forEach((n) => s.append(n));
+}
+
+const ACTION_LABEL = {
+  fill_pallets: (a) => `填实际板数=${a.value}`,
+  update_isa_time: (a) => `更新预约 → ISA ${a.isa} @ ${a.time}`,
+  link_trip: () => "挂靠行程",
+  create_trip: () => "新建行程",
+  create_isa: (a) => `新建预约 ISA ${a.group_isa}`,
+  set_trip_isa: () => "行程补挂预约",
+};
+const PLAN_LABEL = {
+  has_plan_match: ["ok", "✓ 计划一致"],
+  has_plan_mismatch: ["warn", "计划不一致"],
+  has_plan: ["neu", "已有计划"],
+  has_plan_no_isa: ["warn", "行程缺预约"],
+  no_plan: ["bad", "无派送计划"],
+  no_plan_table: ["neu", "不适用"],
+  no_dev_plan_table: ["neu", "DEV 停用"],
+  link_existing: ["brand", "挂靠现有行程"],
+  create_trip: ["brand", "新建行程"],
+  create_isa_and_trip: ["brand", "新建预约+行程"],
+  already_on_trip: ["ok", "✓ 已在行程中"],
+};
+
+function planCell(row) {
+  const p = row.plan || {};
+  const [cls, label] = PLAN_LABEL[p.status] || ["neu", p.status || "—"];
+  const bits = [el("span", { class: "chip " + cls }, label)];
+  if (p.current_isa) bits.push(el("div", { class: "sub" },
+    `现挂 ISA ${p.current_isa} @ ${p.current_time || "无时间"}`));
+  if (p.trip_total !== undefined && p.trip_total !== null)
+    bits.push(el("div", { class: "sub" }, `行程合计约 ${p.trip_total} 板`));
+  return el("div", {}, ...bits);
+}
+
+function renderSyncRows(r, committed) {
+  const mount = $("#syncResults");
+  mount.innerHTML = "";
+  const cols = ["", "行", "柜号", "路线", "板数", "箱数", "ISA / 时间", "3.1 匹配", "派送计划", "动作", "警告 / 说明"];
+  const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c))));
+  const tbody = el("tbody");
+
+  for (const row of r.rows) {
+    const p = row.parsed || {};
+    const m = row.match || {};
+    const err = row.parse_error || row.match_error;
+    const actionable = row.actions.length > 0 && row.blockers.length === 0 && !err;
+
+    // ---- checkbox ----
+    const chk = el("input", { type: "checkbox", class: "rowchk", "data-line": row.line_no });
+    if (!actionable || committed) chk.disabled = true;
+    else chk.checked = true;
+    chk.addEventListener("change", updateExecCount);
+
+    // ---- pallets cell: 提供 / 预计 / 现有 ----
+    const palBits = [String(p.pallets ?? "—")];
+    if (m.estimated != null) palBits.push(`预计 ${m.estimated}`);
+    if (m.actual_existing) palBits.push(`现值「${m.actual_existing}」`);
+    const palletCellNode = el("div", {}, palBits[0],
+      ...palBits.slice(1).map((t) => el("div", { class: "sub" }, t)));
+
+    // ---- boxes cell ----
+    const boxNode = el("div", {}, String(p.boxes ?? "—"),
+      m.boxes != null ? el("div", { class: "sub" + (Number(m.boxes) !== p.boxes ? " subbad" : "") },
+        `3.1: ${m.boxes}`) : null);
+
+    // ---- ISA/time ----
+    const isaNode = p.isa
+      ? el("div", {}, String(p.isa), el("div", { class: "sub" }, `${p.time}${p.tz ? " " + p.tz : ""}`))
+      : el("span", { class: "nullcell" }, "—");
+
+    // ---- match cell ----
+    const matchNode = err
+      ? el("span", { class: "chip bad", title: err }, row.parse_error ? "格式错误" : "匹配失败")
+      : el("div", {}, el("span", { class: "chip ok" }, "✓ " + (m.awb || "")),
+          m.batch ? el("div", { class: "sub" }, m.batch) : null);
+
+    // ---- actions ----
+    let actNode;
+    const c = row.commit || {};
+    if (committed && row.approved) {
+      if (c.error) actNode = el("span", { class: "chip bad", title: c.error }, "✗ 失败");
+      else if (c.skipped) actNode = el("span", { class: "chip warn", title: c.skipped }, "跳过");
+      else if (c.verified === true) actNode = el("span", { class: "chip ok" }, "✓ 已写入并回读核实");
+      else if (c.verified === false) actNode = el("span", { class: "chip bad" }, "⚠ 写入后核实未通过");
+      else actNode = el("span", { class: "chip neu" }, "无需改动");
+    } else if (err) {
+      actNode = el("span", { class: "nullcell" }, "—");
+    } else if (row.blockers.length) {
+      actNode = el("div", {}, ...row.blockers.map((b) => el("div", { class: "chip bad", title: b }, "⛔ " + clip(b))));
+    } else if (!row.actions.length) {
+      actNode = el("span", { class: "chip neu" }, "无需改动");
+    } else {
+      actNode = el("div", { class: "actlist" }, ...row.actions.map((a) =>
+        el("div", { class: "chip brand" }, (ACTION_LABEL[a.type] || (() => a.type))(a))));
+    }
+
+    // ---- warnings / notes ----
+    const wNode = el("div", { class: "warnlist" },
+      ...row.warnings.map((w) => el("div", { class: "wline" }, "⚠ " + w)),
+      ...(row.notes || []).map((n) => el("div", { class: "nline" }, n)),
+      err ? el("div", { class: "wline bad" }, "✗ " + err) : null,
+      ...(committed && c.checks ? c.checks.map((ck) =>
+        el("div", { class: ck.ok ? "nline" : "wline" },
+          `${ck.ok ? "✓" : "✗"} ${ck.what}${ck.ok ? "" : `（回读=${ck.got}）`}`)) : []));
+
+    const tr = el("tr", { class: err ? "rowbad" : row.warnings.length ? "rowwarn" : "" },
+      el("td", {}, chk),
+      el("td", {}, String(row.line_no)),
+      el("td", {}, el("b", {}, p.awb || "?")),
+      el("td", {}, p.dest || "—"),
+      el("td", {}, palletCellNode),
+      el("td", {}, boxNode),
+      el("td", {}, isaNode),
+      el("td", {}, matchNode),
+      el("td", {}, err ? el("span", { class: "nullcell" }, "—") : planCell(row)),
+      el("td", {}, actNode),
+      el("td", { class: "wcol" }, wNode));
+    tbody.append(tr);
+  }
+  mount.append(el("div", { class: "tablewrap" }, el("table", { class: "synctable" }, thead, tbody)));
+
+  if (!committed) {
+    const n = r.rows.filter((x) => x.actions.length && !x.blockers.length
+      && !x.parse_error && !x.match_error).length;
+    $("#execBar").hidden = n === 0;
+    updateExecCount();
+  } else {
+    $("#execBar").hidden = true;
+  }
+}
+
+function updateExecCount() {
+  const n = document.querySelectorAll("#syncResults input.rowchk:checked:not(:disabled)").length;
+  $("#syncExecBtn").textContent = `执行选中更新（${n} 行）`;
+  $("#syncExecBtn").disabled = n === 0 || sync.busy;
+  $("#execTip").textContent = n ? "将按左侧勾选执行 — 双重确认后才写入" : "没有勾选可执行的行";
+}
+
+function execSync() {
+  if (!sync.plan) return;
+  const approvals = [...document.querySelectorAll("#syncResults input.rowchk:checked:not(:disabled)")]
+    .map((c) => Number(c.dataset.line))
+    .map((n) => {
+      const row = sync.plan.rows.find((x) => x.line_no === n);
+      return { line_no: n, sig: row.sig };
+    });
+  if (!approvals.length) return;
+
+  // Confirmation summary: exactly what will be written, grouped by type.
+  const counts = {};
+  for (const a of approvals) {
+    const row = sync.plan.rows.find((x) => x.line_no === a.line_no);
+    for (const act of row.actions)
+      counts[act.type] = (counts[act.type] || 0) + 1;
+  }
+  const NAMES = { fill_pallets: "填实际板数", update_isa_time: "更新预约ISA/时间",
+    link_trip: "挂靠行程", create_trip: "新建行程(5.x)", create_isa: "新建预约(5.6)",
+    set_trip_isa: "行程补挂预约" };
+  const lines = Object.entries(counts).map(([k, v]) => `  · ${NAMES[k] || k} × ${v}`);
+  const envLabel = sync.plan.env === "dev" ? "DEV 测试环境（dev 副本表）" : "‼ PROD 生产环境";
+  if (!confirm(`确认执行以下写入？\n\n环境：${envLabel}\n仓库：${sync.plan.warehouse}` +
+    `（账号 ${sync.plan.account || "—"}）\n\n${lines.join("\n")}\n\n共 ${approvals.length} 行。`))
+    return;
+
+  runCommit(approvals);
+}
+
+function renderCommitOutcome(r) {
+  sync.plan = r;
+  const done = r.rows.filter((x) => (x.commit || {}).done && !(x.commit || {}).skipped).length;
+  const verified = r.rows.filter((x) => (x.commit || {}).verified === true).length;
+  const failed = r.rows.filter((x) => (x.commit || {}).error).length;
+  const skipped = r.rows.filter((x) => (x.commit || {}).skipped).length;
+  (failed ? cerr : clog)("执行", "完成", `成功=${done} 回读核实=${verified} 失败=${failed} 跳过=${skipped}`);
+  setSyncStatus([
+    el("span", { class: "pill" }, "✅ 已执行 ", el("b", {}, String(done))),
+    el("span", { class: "pill" }, "回读核实 ", el("b", {}, String(verified))),
+    failed ? el("span", { class: "pill warnpill" }, `✗ 失败 ${failed}`) : null,
+    skipped ? el("span", { class: "pill warnpill" }, `跳过 ${skipped}`) : null,
+  ].filter(Boolean), failed > 0);
+  renderSyncRows(r, true);
+  renderWarningsSummary(r);
+}
+
+// warn before closing the page while a COMMIT is in flight (the job keeps
+// running server-side; reopening re-attaches, but the operator should know)
+window.addEventListener("beforeunload", (e) => {
+  const j = sessionStorage.getItem("larkSyncJob");
+  if (j && JSON.parse(j).kind === "commit" && sync.busy) {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
+
+async function runCommit(approvals) {
+  const btn = $("#syncExecBtn");
+  sync.busy = true; btn.disabled = true; btn.textContent = "执行中…";
+  $("#syncStatus").hidden = true;
+  showProgress("commit");
+  clog("执行", "开始", `行=${approvals.length}`, `环境=${sync.plan.env}`);
+  try {
+    const r = await fetch("/api/sync/commit", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ warehouse: sync.warehouse, text: $("#syncInput").value,
+        approvals, env: sync.plan.env }),
+    }).then((x) => x.json());
+    if (!r.ok) {
+      if (r.busy) {
+        // another commit is running (other tab / earlier click) — attach to
+        // it for visibility instead of failing into the void
+        cerr("执行", r.error);
+        setSyncStatus([el("span", {}, "⚠ " + r.error + " — 已跟踪其进度")], true);
+        const latest = await fetch("/api/sync/job?id=latest").then((x) => x.json());
+        if (latest.ok && latest.job.state === "running")
+          await pollJob(latest.job.id, "commit").catch(() => {});
+        hideProgress();
+        sync.busy = false; updateExecCount();
+        return;
+      }
+      throw new Error(r.error || "执行失败");
+    }
+    rememberJob(r.job.id, "commit");
+    const job = await pollJob(r.job.id, "commit");
+    forgetJob();
+    hideProgress();
+    renderCommitOutcome(job.result);
+  } catch (e) {
+    hideProgress();
+    cerr("执行", "失败:", e.message);
+    setSyncStatus([el("span", {}, "⚠ 执行失败：" + e.message)], true);
+    sync.busy = false; updateExecCount();
+    return;
+  }
+  sync.busy = false;
+}
+
+// Page-refresh re-attach: if a job was in flight when the tab reloaded,
+// resume polling it and render its result when it lands.
+async function reattachJob() {
+  const raw = sessionStorage.getItem("larkSyncJob");
+  if (!raw) return;
+  let saved;
+  try { saved = JSON.parse(raw); } catch { forgetJob(); return; }
+  let r;
+  try {
+    r = await fetch("/api/sync/job?id=" + encodeURIComponent(saved.id))
+      .then((x) => x.json());
+  } catch { return; }        // server unreachable — keep the id for next load
+  if (!r.ok) { forgetJob(); return; }
+  const job = r.job;
+  if (job.state === "running") {
+    clog("恢复", `重新连接到进行中的${saved.kind === "commit" ? "写入" : "预检"}任务`, job.id);
+    sync.busy = true;
+    showProgress(saved.kind);
+    updateProgress(job, false);
+    try {
+      const finished = await pollJob(job.id, saved.kind);
+      hideProgress();
+      if (saved.kind === "commit") renderCommitOutcome(finished.result);
+      else renderPlanOutcome(finished.result);
+      if (finished.result && finished.result.warehouse) restoreWarehouse(finished.result.warehouse);
+    } catch (e) {
+      hideProgress();
+      setSyncStatus([el("span", {}, "⚠ " + e.message)], true);
+    }
+    forgetJob();
+    sync.busy = false;
+    gateSyncPlan();
+  } else {
+    forgetJob();             // finished while we were away — results were seen
+  }
+}
+
+function restoreWarehouse(key) {
+  const seg = $("#whSeg");
+  const b = [...seg.children].find((x) => x.dataset.w === key);
+  if (b && !b.classList.contains("on")) b.click();
+}
+
+// 规范要求：所有警告在最后集中呈现（W1/W2/W3 + 错误），一目了然可复制。
+function renderWarningsSummary(r) {
+  const mount = $("#syncWarnings");
+  mount.innerHTML = "";
+  const ws = r.warnings_summary || [];
+  const errs = r.rows.filter((x) => (x.commit || {}).error)
+    .map((x) => `第${x.line_no}行 ${(x.parsed || {}).awb || ""}: ${x.commit.error}`);
+  const skips = r.rows.filter((x) => (x.commit || {}).skipped && x.approved)
+    .map((x) => `第${x.line_no}行 ${(x.parsed || {}).awb || ""}: ${x.commit.skipped}`);
+  if (!ws.length && !errs.length && !skips.length) {
+    mount.hidden = false;
+    mount.append(el("div", { class: "warnhead ok" }, "✅ 执行完毕 — 无警告"));
+    return;
+  }
+  mount.hidden = false;
+  mount.append(el("div", { class: "warnhead" },
+    `⚠ 警告汇总（${ws.length + errs.length + skips.length} 条）— 请人工复核`));
+  const list = el("div", { class: "warnitems" });
+  for (const w of ws) list.append(el("div", { class: "wline" }, "⚠ " + w));
+  for (const s of skips) list.append(el("div", { class: "wline" }, "⏭ " + s));
+  for (const e2 of errs) list.append(el("div", { class: "wline bad" }, "✗ " + e2));
+  mount.append(list);
+  const btn = el("button", { class: "mini" }, "复制警告");
+  btn.addEventListener("click", () => {
+    navigator.clipboard.writeText([...ws, ...skips, ...errs].join("\n"));
+    btn.textContent = "已复制";
+  });
+  mount.append(btn);
+}
 
 boot();

@@ -3,81 +3,142 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>LarkTunnel · 库存查询</title>
+  <title>LarkTunnel · 到仓核对台</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">🚇 <b>LarkTunnel</b> <span>库存查询</span></div>
-    <div class="hint">柜号 / ISA → 3.1 实时查询 · <span id="tzNote">—</span></div>
+    <div class="brand">🚇 <b>LarkTunnel</b> <span>到仓核对台</span>
+      <span id="envBadge" class="envbadge" hidden></span>
+    </div>
+    <div class="hint"><span id="tzNote">—</span></div>
   </header>
 
+  <nav class="tabs" id="tabs">
+    <button data-tab="sync" class="on">⚡ 预约同步</button>
+    <button data-tab="query">🔍 库存查询</button>
+    <button data-tab="upload">📄 文件上传</button>
+  </nav>
+
   <main class="wrap">
-    <section class="panel controls">
-      <div class="grid">
-        <label class="fld">
-          <span>表</span>
-          <select id="tableSel"></select>
-        </label>
 
-        <label class="fld grow">
-          <span>视图 <em id="viewCount"></em></span>
-          <div class="viewpick">
-            <input id="viewFilter" type="text" placeholder="输入关键字过滤 107 个视图…" autocomplete="off" />
-            <select id="viewSel"></select>
-          </div>
-        </label>
-      </div>
+    <!-- ═══════════════ ① 预约同步（batch container check-in） ═══════════════ -->
+    <section id="tab-sync" class="tabpane">
+      <section class="panel controls">
+        <div class="stephead"><b>1 · 选择仓库供应商</b>
+          <span class="stepnote">决定 3.1 匹配条件、预约账号与出库计划表</span></div>
+        <div class="seg wh" id="whSeg"><!-- populated from /api/sync/meta --></div>
+        <div class="tip" id="whTip"></div>
 
-      <div class="grid">
-        <label class="fld">
-          <span>查询字段</span>
-          <div class="seg" id="fieldSeg">
-            <button data-k="awb" class="on">柜号/AWB</button>
-            <button data-k="isa">ISA</button>
-          </div>
-        </label>
+        <div class="stephead mt"><b>2 · 粘贴到仓明细</b>
+          <span class="stepnote">每行一票：柜号 → 路线 → 实际板数 → 箱数（可选再加 ISA + 预约时间）。
+            直接从 Excel 复制即可，制表符/空格均可。</span></div>
+        <textarea id="syncInput" rows="7" spellcheck="false"
+          placeholder="OOCU9020713B&#9;YEG2&#9;4&#9;141
+TCNU4251020B&#9;YEG1&#9;1&#9;4
+CXDU2185835&#9;YEG2&#9;2&#9;135&#9;147204024984&#9;07/27/2026 08:00 MDT"></textarea>
+        <div id="syncLines" class="linelist"></div>
 
-        <label class="fld">
-          <span>匹配方式</span>
-          <div class="seg" id="modeSeg">
-            <button data-m="contains" class="on">包含</button>
-            <button data-m="is">精确</button>
-          </div>
-        </label>
-
-        <label class="fld grow">
-          <span id="valLabel">柜号</span>
-          <input id="valInput" type="text" placeholder="例如 CAJU5283296" autocomplete="off" />
-        </label>
-
-        <div class="fld go">
-          <span>&nbsp;</span>
-          <button id="goBtn" class="primary">查询</button>
+        <div class="syncgo">
+          <button id="syncPlanBtn" class="primary" disabled>查询并预检（只读）</button>
+          <span class="tip" id="syncGoTip">选择仓库并粘贴明细后可查询</span>
         </div>
+      </section>
+
+      <section id="syncStatus" class="status" hidden></section>
+      <section id="syncProgress" class="progresspanel" hidden>
+        <div class="prowhead">
+          <span class="spinner"></span>
+          <b id="progStage">—</b>
+          <span id="progCount" class="progcount"></span>
+          <span id="progElapsed" class="progelapsed"></span>
+        </div>
+        <div class="pbar"><div id="progFill" class="pbar-fill"></div></div>
+        <div id="progCurrent" class="progcurrent"></div>
+      </section>
+      <section id="syncResults" class="results"></section>
+
+      <div class="execbar" id="execBar" hidden>
+        <label class="chkall"><input type="checkbox" id="chkAll" checked /> 全选可执行行</label>
+        <button id="syncExecBtn" class="primary danger">执行选中更新</button>
+        <span class="tip" id="execTip"></span>
       </div>
-      <div class="tip" id="modeTip"></div>
+
+      <section id="syncWarnings" class="warnpanel" hidden></section>
     </section>
 
-    <section class="panel upload">
-      <div class="uphead">
-        <b>📄 上传文件自动识别</b>
-        <span>从 Excel / CSV 中自动提取 柜号 · 批次号 · 仓库供应商 · 目的地路线 · 预约时间 · ISA（缺失返回 <code>Null</code>）</span>
-      </div>
-      <div id="drop" class="drop">
-        <input id="fileInput" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt" hidden />
-        <div class="dropinner">
-          <span class="big">把文件拖到这里</span>
-          <span class="or">或</span>
-          <button id="pickBtn" class="primary">选择文件</button>
-          <span class="fmt">支持 .xlsx / .xlsm / .csv / .tsv / .txt</span>
+    <!-- ═══════════════ ② 库存查询（原查询台） ═══════════════ -->
+    <section id="tab-query" class="tabpane" hidden>
+      <section class="panel controls">
+        <div class="grid">
+          <label class="fld">
+            <span>表</span>
+            <select id="tableSel"></select>
+          </label>
+
+          <label class="fld grow">
+            <span>视图 <em id="viewCount"></em></span>
+            <div class="viewpick">
+              <input id="viewFilter" type="text" placeholder="输入关键字过滤视图…" autocomplete="off" />
+              <select id="viewSel"></select>
+            </div>
+          </label>
         </div>
-      </div>
-      <div id="parseOut" class="parseout" hidden></div>
+
+        <div class="grid">
+          <label class="fld">
+            <span>查询字段</span>
+            <div class="seg" id="fieldSeg">
+              <button data-k="awb" class="on">柜号/AWB</button>
+              <button data-k="isa">ISA</button>
+            </div>
+          </label>
+
+          <label class="fld">
+            <span>匹配方式</span>
+            <div class="seg" id="modeSeg">
+              <button data-m="contains" class="on">包含</button>
+              <button data-m="is">精确</button>
+            </div>
+          </label>
+
+          <label class="fld grow">
+            <span id="valLabel">柜号</span>
+            <input id="valInput" type="text" placeholder="例如 CAJU5283296" autocomplete="off" />
+          </label>
+
+          <div class="fld go">
+            <span>&nbsp;</span>
+            <button id="goBtn" class="primary">查询</button>
+          </div>
+        </div>
+        <div class="tip" id="modeTip"></div>
+      </section>
+
+      <section id="status" class="status" hidden></section>
+      <section id="results" class="results"></section>
     </section>
 
-    <section id="status" class="status" hidden></section>
-    <section id="results" class="results"></section>
+    <!-- ═══════════════ ③ 文件上传（原上传识别） ═══════════════ -->
+    <section id="tab-upload" class="tabpane" hidden>
+      <section class="panel upload">
+        <div class="uphead">
+          <b>📄 上传文件自动识别</b>
+          <span>从 Excel / CSV 中自动提取 柜号 · 批次号 · 仓库供应商 · 目的地路线 · 预约时间 · ISA（缺失返回 <code>Null</code>）</span>
+        </div>
+        <div id="drop" class="drop">
+          <input id="fileInput" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt" hidden />
+          <div class="dropinner">
+            <span class="big">把文件拖到这里</span>
+            <span class="or">或</span>
+            <button id="pickBtn" class="primary">选择文件</button>
+            <span class="fmt">支持 .xlsx / .xlsm / .csv / .tsv / .txt</span>
+          </div>
+        </div>
+        <div id="parseOut" class="parseout" hidden></div>
+      </section>
+    </section>
+
   </main>
 
   <script src="/static/app.js"></script>

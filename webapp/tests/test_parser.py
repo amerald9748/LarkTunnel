@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+"""Unit tests for appointment_sync.parse_line / parse_batch / norm_time.
+Offline — no network. Run:  python -m unittest discover webapp/tests -v"""
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import appointment_sync as sync  # noqa: E402
+
+
+class TestNormTime(unittest.TestCase):
+    def test_month_first(self):        # operator paste format
+        self.assertEqual(sync.norm_time("07/30/2026 13:00"), "2026/07/30 13:00")
+
+    def test_year_first(self):         # 5.6 stored format
+        self.assertEqual(sync.norm_time("2026/07/30 13:00"), "2026/07/30 13:00")
+
+    def test_single_digits(self):
+        self.assertEqual(sync.norm_time("7/3/2026 8:05"), "2026/07/03 08:05")
+
+    def test_dashes(self):
+        self.assertEqual(sync.norm_time("2026-07-30 13:00"), "2026/07/30 13:00")
+
+    def test_invalid(self):
+        for bad in (None, "", "13:00", "07/30/26 13:00", "2026/07/30", "30/07/2026 25:00",
+                    "13/45/2026 10:00"):
+            self.assertIsNone(sync.norm_time(bad), bad)
+
+    def test_roundtrip_equality(self):
+        # The SAME canonicalizer runs on both sides of the match comparison.
+        self.assertEqual(sync.norm_time("07/27/2026 08:00"), sync.norm_time("2026/07/27 08:00"))
+
+
+class TestParseLine(unittest.TestCase):
+    # ---- the user's three canonical examples --------------------------------
+    def test_example_1_basic(self):
+        p = sync.parse_line("OOCU9020713B\tYEG2\t4\t141")
+        self.assertNotIn("error", p)
+        self.assertEqual((p["awb"], p["dest"], p["pallets"], p["boxes"]),
+                         ("OOCU9020713B", "YEG2", 4, 141))
+        self.assertIsNone(p["isa"])
+
+    def test_example_2_basic(self):
+        p = sync.parse_line("TCNU4251020B\tYEG1\t1\t4")
+        self.assertNotIn("error", p)
+        self.assertEqual(p["pallets"], 1)
+
+    def test_example_3_missing_pallets_rejected(self):
+        p = sync.parse_line("CSGU6249922\tYVR4\t\t96")
+        self.assertIn("error", p)
+        self.assertIn("空列", p["error"])
+
+    def test_example_3_space_variant_rejected(self):
+        # Same ambiguity when the empty cell collapses into plain spaces.
+        p = sync.parse_line("CSGU6249922 YVR4  96")
+        self.assertIn("error", p)
+
+    def test_full_form_with_tz(self):
+        p = sync.parse_line("OOCU9020713B\tYEG2\t4\t141 7403350996\t 07/30/2026 13:00 PDT")
+        self.assertNotIn("error", p)
+        self.assertEqual(p["isa"], 7403350996)
+        self.assertEqual(p["time"], "2026/07/30 13:00")
+        self.assertEqual(p["tz"], "PDT")
+
+    def test_full_form_example_2(self):
+        p = sync.parse_line("CXDU2185835\tYEG2\t2\t135\t147204024984\t 07/27/2026 08:00 MDT")
+        self.assertNotIn("error", p)
+        self.assertEqual(p["isa"], 147204024984)
+        self.assertEqual(p["time"], "2026/07/27 08:00")
+
+    def test_full_form_without_tz(self):
+        p = sync.parse_line("CXDU2185835 YEG2 2 135 147204024984 07/27/2026 08:00")
+        self.assertNotIn("error", p)
+        self.assertIsNone(p["tz"])
+
+    # ---- rejection rules -----------------------------------------------------
+    def test_isa_without_time_rejected(self):
+        p = sync.parse_line("OOCU9020713B YEG2 4 141 7403350996")
+        self.assertIn("error", p)
+
+    def test_isa_with_date_but_no_time_rejected(self):
+        p = sync.parse_line("OOCU9020713B YEG2 4 141 7403350996 07/30/2026")
+        self.assertIn("error", p)
+
+    def test_isa_slid_into_boxes_position(self):
+        # pallets missing -> ISA lands in the 箱数 slot -> must be caught
+        p = sync.parse_line("CSGU6249922 YVR4 96 7403350996 07/30/2026 13:00 PDT")
+        self.assertIn("error", p)
+
+    def test_bad_dest(self):
+        for d in ("YEG0", "YVR10", "YYZ4", "ABC1", "yeg"):
+            p = sync.parse_line(f"OOCU9020713B {d} 4 141")
+            self.assertIn("error", p, d)
+
+    def test_lowercase_dest_ok(self):
+        p = sync.parse_line("oocu9020713b yeg2 4 141")
+        self.assertNotIn("error", p)
+        self.assertEqual(p["dest"], "YEG2")
+        self.assertEqual(p["awb"], "OOCU9020713B")
+
+    def test_non_numeric_pallets(self):
+        p = sync.parse_line("OOCU9020713B YEG2 4P 141")
+        self.assertIn("error", p)
+
+    def test_zero_pallets_rejected(self):
+        p = sync.parse_line("OOCU9020713B YEG2 0 141")
+        self.assertIn("error", p)
+
+    def test_bad_isa_length(self):
+        p = sync.parse_line("OOCU9020713B YEG2 4 141 12345 07/30/2026 13:00")
+        self.assertIn("error", p)
+
+    def test_bad_time(self):
+        p = sync.parse_line("OOCU9020713B YEG2 4 141 7403350996 07/30/26 13:00")
+        self.assertIn("error", p)
+
+    def test_bad_tz(self):
+        p = sync.parse_line("OOCU9020713B YEG2 4 141 7403350996 07/30/2026 13:00 P8T")
+        self.assertIn("error", p)
+
+    def test_nbsp_and_fullwidth_space(self):
+        p = sync.parse_line("OOCU9020713B YEG2　4 141")
+        self.assertNotIn("error", p)
+        self.assertEqual(p["pallets"], 4)
+
+    def test_air_waybill_style(self):
+        p = sync.parse_line("093-9992123 YYC3 12 300")
+        self.assertNotIn("error", p)
+        self.assertEqual(p["awb"], "093-9992123")
+
+
+class TestParseBatch(unittest.TestCase):
+    def test_blank_lines_skipped(self):
+        rows = sync.parse_batch("\nOOCU9020713B YEG2 4 141\n\n  \nTCNU4251020B YEG1 1 4\n")
+        self.assertEqual([r["line_no"] for r in rows], [2, 5])
+
+    def test_duplicate_awb_dest_rejected(self):
+        rows = sync.parse_batch("OOCU9020713B YEG2 4 141\nOOCU9020713B YEG2 5 141")
+        self.assertNotIn("error", rows[0])
+        self.assertIn("error", rows[1])
+        self.assertIn("重复", rows[1]["error"])
+
+    def test_same_awb_different_dest_ok(self):
+        rows = sync.parse_batch("OOCU9020713B YEG2 4 141\nOOCU9020713B YEG1 5 99")
+        self.assertNotIn("error", rows[0])
+        self.assertNotIn("error", rows[1])
+
+    def test_error_lines_do_not_reserve_dedup_key(self):
+        rows = sync.parse_batch("CSGU6249922\tYVR4\t\t96\nCSGU6249922 YVR4 3 96")
+        self.assertIn("error", rows[0])       # malformed
+        self.assertNotIn("error", rows[1])    # the FIXED line must be accepted
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

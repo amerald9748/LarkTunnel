@@ -6,7 +6,8 @@
   "scripts": {
     "verify:config": "node scripts/verify-config.js",
     "import:inventory": "node src/workflow/create-inventory-records.js",
-    "test": "echo \"No automated tests — see docs/60 Safety\" && exit 0"
+    "test": "python -m unittest discover webapp/tests",
+    "test:integration": "python webapp/tests/integration_dev.py"
   },
   "keywords": ["lark", "feishu", "bitable", "warehouse", "automation"],
   "author": "",

@@ -41,6 +41,55 @@ module.exports = {
   },
 
   // ---------------------------------------------------------------------------
+  // DEV environment (user-created copies for testing).
+  // LARK_ENV=dev makes the webapp read/write THESE copies. A warehouse whose
+  // plan table has NO devTables entry is trip-DISABLED in dev (pallet checks
+  // still work) — dev mode NEVER writes into the shared/prod 5.x tables.
+  //
+  // To enable another warehouse in dev: duplicate its 5.x table in Lark, then
+  // add the SAME plan-table key to devTables AND the three dev field maps
+  // below. (Lark copies preserve the 5.x-side field names; the auto-created
+  // back-columns on DEV 3.1 / DEV 5.6 get long generated names — run
+  // scratchpad inspect or check the field list and copy them exactly.)
+  // ---------------------------------------------------------------------------
+  devTables: {
+    '3.1': 'tblQcXC82tDveeSp', // DEV copy of 3.1 (155 fields, verified 2026-07-31)
+    '5.6': 'tblIsKv8k3vvDs0B', // DEV copy of 5.6 (16 fields, verified 2026-07-31)
+    // "5.2 BESTAR-CAL-P-01 副本" — full-dev trip table (user-created 2026-07-31)
+    '5.2 BESTAR-CAL': 'tblJaXrkXhZr3R6N',
+  },
+
+  // prod: 5.x -> 3.1 inventory back-link (the "库存信息-XXX" columns).
+  // Verified live 2026-07-31.
+  prodTripLinkFields: {
+    '5.2 BESTAR-CAL': '库存信息-卡尔加里',
+    '5.3 WBLL-EDM': '库存信息-埃德蒙顿',
+    '5.4 VAST-VAN-01': '库存信息-元浩',
+    '5.5 GFL-VAN-02': '库存信息-GFL',
+  },
+
+  // ---- dev-pipeline field names (verified live 2026-07-31) -----------------
+  // ON THE DEV 5.x COPY: link -> DEV 3.1 (same field name as on the prod
+  // table, because Lark copies preserve field names).
+  devTripLinkFields: {
+    '5.2 BESTAR-CAL': '3.1 库存总表 副本-5.2 BESTAR-CAL',
+  },
+  // ON THE DEV 5.x COPY: link -> DEV 5.6 (prod equivalent is '预约信息').
+  devTripIsaFields: {
+    '5.2 BESTAR-CAL': '5.6 预约表 副本-5.2 出库计划 卡尔加里',
+  },
+  // ON DEV 3.1: the plan-link column pointing at the dev 5.x copy (prod
+  // equivalent is the column named like the table label itself).
+  devPlanLinkFields31: {
+    '5.2 BESTAR-CAL': '5.2 BESTAR-CAL-P-01 副本-3.1 库存总表 副本-5.2 BESTAR-CAL',
+  },
+  // ON DEV 5.6: the back-link column pointing at the dev 5.x copy (prod
+  // equivalent: '5.2 出库计划 卡尔加里' etc — see appointment_sync.LINK_ON_56).
+  devLinkOn56: {
+    '5.2 BESTAR-CAL': '5.2 BESTAR-CAL-P-01 副本-5.6 预约表 副本-5.2 出库计划 卡尔加里',
+  },
+
+  // ---------------------------------------------------------------------------
   // Field names — the exact column names used by the workflow.
   // Grouped by table. Change here if a column is renamed in Lark.
   // ---------------------------------------------------------------------------
@@ -93,10 +142,18 @@ module.exports = {
       // the 5.6 side (fields.appointment.planLinks) auto-fills, and the 5.x
       // ISA / 预约时间 formula columns resolve from the link.
       isaLink: '预约信息',
-      // VERIFY — '总板数' does not exist on live 5.x tables; the pallet total
-      // is '出库板数' (5.2/5.3) / '出库板数-元浩' (5.4) / '出库板数-GFL' (5.5),
-      // all read-only Lookup/Formula columns. Overflow check must read those.
-      totalPallets: '总板数',
+      // '总板数' does not exist on live 5.x tables. The rollup columns are
+      // '出库板数' (5.2/5.3) / '出库板数-元浩' (5.4) / '出库板数-GFL' (5.5) —
+      // read-only Lookup/Formula, and they roll up ONLY the prod link column,
+      // so they are blind in dev mode. The webapp therefore COMPUTES trip
+      // totals from the trip's linked 3.1 rows (实际板数, falling back to
+      // 预计板数) — one code path that is correct in both environments.
+      rollupPallets: {
+        '5.2 BESTAR-CAL': '出库板数',
+        '5.3 WBLL-EDM': '出库板数',
+        '5.4 VAST-VAN-01': '出库板数-元浩',
+        '5.5 GFL-VAN-02': '出库板数-GFL',
+      },
       // Two-way back-link field pointing to 3.1 inventory rows. The label
       // differs per warehouse table (e.g. "库存信息-卡尔加里"). Declared per
       // warehouse in `warehouses[].inventoryBackLinkField`.
@@ -117,14 +174,14 @@ module.exports = {
       account: 'BESTAR',
       planTable: '5.2 BESTAR-CAL',
       planLinkField: '5.2 BESTAR-CAL',
-      inventoryBackLinkField: '库存信息-卡尔加里', // VERIFY (Calgary)
+      inventoryBackLinkField: '库存信息-卡尔加里', // confirmed live 2026-07-31
       region: 'CAL',
     },
     WBLL: {
       account: 'WBLL',
       planTable: '5.3 WBLL-EDM',
       planLinkField: '5.3 WBLL-EDM',
-      inventoryBackLinkField: '库存信息-埃德蒙顿', // VERIFY (Edmonton)
+      inventoryBackLinkField: '库存信息-埃德蒙顿', // confirmed live 2026-07-31
       region: 'EDM',
     },
     VAST: {
@@ -147,7 +204,7 @@ module.exports = {
       account: 'BESTAR',
       planTable: '5.2 BESTAR-CAL',
       planLinkField: '5.2 BESTAR-CAL',
-      inventoryBackLinkField: '库存信息-卡尔加里', // VERIFY (Calgary)
+      inventoryBackLinkField: '库存信息-卡尔加里', // confirmed live 2026-07-31
       region: 'CAL',
     },
 

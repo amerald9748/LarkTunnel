@@ -12,7 +12,19 @@ Design notes
 * Secrets (App ID / Secret) are read from `config/secrets.txt` SERVER-SIDE only
   and used to mint a tenant_access_token. The secret and the token are never
   returned to callers / the browser.
-* READ ONLY. There are no write methods here on purpose.
+* READ ONLY. There are no write methods here on purpose. Writer modules
+  (upload_56.py / appointment_sync.py) call `_api` directly and MUST hold
+  WRITE_LOCK (defined below) so all webapp writes are serialized process-wide.
+
+Environments (LARK_ENV)
+-----------------------
+`LARK_ENV=dev` points the 3.1 / 5.6 labels at the user-created DEV copies
+(config.js `devTables`); anything not listed there (the 5.x delivery-plan
+tables) resolves to the same id in both environments — those tables are
+SHARED, only their link *field names* differ per env (config.js
+`prodTripLinkFields` / `devTripLinkFields` / `devTripIsaFields`).
+Resolve ids through `table_id(label)`; `config_values()["tables"]` stays the
+raw PROD registry for backward compatibility (search UI lists prod tables).
 
 Why view filtering happens locally
 ----------------------------------
@@ -50,6 +62,15 @@ HOSTS = ["https://open.feishu.cn", "https://open.larksuite.com"]    # China firs
 
 DATE_TYPES = {5, 1001, 1002}  # datetime, created-time, modified-time
 
+# Which copies of 3.1 / 5.6 this process talks to. "prod" unless LARK_ENV=dev.
+ENV = "dev" if os.environ.get("LARK_ENV", "").strip().lower() == "dev" else "prod"
+
+# Process-wide write serialization. All webapp writers (upload_56,
+# appointment_sync) do check-then-write against /records/search, so two
+# concurrent commits could both pass the existence check and double-create.
+# ONE shared lock keeps every write path serialized.
+WRITE_LOCK = threading.Lock()
+
 
 class LarkError(Exception):
     def __init__(self, message, code=None):
@@ -69,8 +90,20 @@ def _read(path):
 _cfg_cache = {}
 
 
+def _flat_block(cfg, key):
+    """Parse a FLAT `key: { 'k': 'v', ... }` object literal out of config.js.
+    Only works for flat maps (no nested braces) — which is exactly why the
+    env maps in config.js are declared flat."""
+    m = re.search(re.escape(key) + r":\s*\{(.*?)\}", cfg, re.S)
+    if not m:
+        return {}
+    return dict(re.findall(r"'([^']+)'\s*:\s*'([^']+)'", m.group(1)))
+
+
 def config_values():
-    """Return {'base_token':..., 'tables': {label: id}} parsed from config.js."""
+    """Return the parsed config.js registry:
+    {'base_token', 'tables' (PROD), 'dev_tables',
+     'prod_trip_link_fields', 'dev_trip_link_fields', 'dev_trip_isa_fields'}"""
     if _cfg_cache:
         return _cfg_cache
     cfg = _read(os.path.join(ROOT, "config", "config.js"))
@@ -78,12 +111,41 @@ def config_values():
     if not m:
         raise LarkError("Could not find baseToken in config/config.js")
     tables = {}
-    tb = re.search(r"tables:\s*\{(.*?)\}", cfg, re.S)
+    # NOTE: matches the FIRST `tables:` block — the top-level PROD registry.
+    # ("devTables:" does not match because the regex is case-sensitive.)
+    tb = re.search(r"(?<![A-Za-z])tables:\s*\{(.*?)\}", cfg, re.S)
     if tb:
         for label, tid in re.findall(r"'([^']+)'\s*:\s*'(tbl[^']+)'", tb.group(1)):
             tables[label] = tid
-    _cfg_cache.update({"base_token": m.group(1), "tables": tables})
+    _cfg_cache.update({
+        "base_token": m.group(1),
+        "tables": tables,
+        "dev_tables": _flat_block(cfg, "devTables"),
+        "prod_trip_link_fields": _flat_block(cfg, "prodTripLinkFields"),
+        "dev_trip_link_fields": _flat_block(cfg, "devTripLinkFields"),
+        "dev_trip_isa_fields": _flat_block(cfg, "devTripIsaFields"),
+        "dev_plan_link_fields_31": _flat_block(cfg, "devPlanLinkFields31"),
+        "dev_link_on_56": _flat_block(cfg, "devLinkOn56"),
+    })
     return _cfg_cache
+
+
+def env():
+    """'prod' or 'dev' — which copies of 3.1/5.6 this process reads/writes."""
+    return ENV
+
+
+def table_id(label):
+    """Resolve a table label to its id FOR THE CURRENT ENV.
+    dev: labels with a devTables entry (3.1 / 5.6 / copied 5.x tables)
+    resolve to the dev copies; anything else falls through to the prod id."""
+    cfg = config_values()
+    if ENV == "dev" and label in cfg["dev_tables"]:
+        return cfg["dev_tables"][label]
+    t = cfg["tables"].get(label)
+    if not t:
+        raise LarkError(f"config.js: unknown table label '{label}'")
+    return t
 
 
 def _load_creds():
@@ -125,7 +187,7 @@ _lock = threading.Lock()
 _token = {"host": None, "value": None, "exp": 0}
 
 
-def _http(method, url, headers=None, payload=None, timeout=60):
+def _http(method, url, headers=None, payload=None, timeout=30):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     h = {"Content-Type": "application/json; charset=utf-8"}
     h.update(headers or {})
@@ -137,7 +199,13 @@ def _http(method, url, headers=None, payload=None, timeout=60):
         body = e.read().decode("utf-8", "ignore")
         raise LarkError(f"HTTP {e.code} from Feishu: {body[:300]}", code=e.code)
     except urllib.error.URLError as e:
-        raise LarkError(f"Network error reaching Feishu: {getattr(e, 'reason', e)}")
+        raise LarkError(f"Network error reaching Feishu: {getattr(e, 'reason', e)}",
+                        code="net")
+    except (TimeoutError, OSError) as e:
+        # A mid-response socket stall raises raw TimeoutError/OSError (NOT a
+        # URLError) — leaking it upward froze/crashed callers, which was the
+        # reported "button hangs sometimes". Wrap it like any network fault.
+        raise LarkError(f"Feishu 响应超时或连接中断: {e}", code="net")
 
 
 def _get_token():
@@ -162,15 +230,43 @@ def _get_token():
         raise LarkError(f"Auth failed (tenant_access_token). Last: {last}")
 
 
+# Read-only endpoints (searches are POSTs, so method alone can't tell): these
+# are safe to retry after a transient network fault.
+_READ_SUFFIXES = ("/records/search", "/records/batch_get", "/fields", "/views")
+
+
 def _api(method, path, payload=None, query=None):
-    host, tok = _get_token()
-    url = f"{host}{path}"
-    if query:
-        url += "?" + urllib.parse.urlencode(query)
-    r = _http(method, url, headers={"Authorization": f"Bearer {tok}"}, payload=payload)
-    if r.get("code") != 0:
-        raise LarkError(f"Feishu API error code {r.get('code')}: {r.get('msg')}", code=r.get("code"))
-    return r.get("data", {})
+    """One Feishu call with transient-fault retries.
+    Retried (2×, 1s/2s backoff) when the failure is transport-level AND the
+    call is safe to repeat: GETs, the read-only POST endpoints above, or any
+    write carrying a client_token (the SAME token is resent, so Feishu
+    deduplicates a request that actually landed the first time). Tokenless
+    writes are never auto-retried."""
+    retryable = (method.upper() == "GET"
+                 or any(path.endswith(s) or (s + "/") in path for s in _READ_SUFFIXES)
+                 or bool((query or {}).get("client_token")))
+    attempts = 3 if retryable else 1
+    last = None
+    for i in range(attempts):
+        if i:
+            time.sleep(i)                       # 1s, 2s
+        host, tok = _get_token()
+        url = f"{host}{path}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        try:
+            r = _http(method, url, headers={"Authorization": f"Bearer {tok}"},
+                      payload=payload)
+        except LarkError as e:
+            if e.code == "net" and i < attempts - 1:
+                last = e
+                continue                        # transient — retry
+            raise
+        if r.get("code") != 0:
+            raise LarkError(f"Feishu API error code {r.get('code')}: {r.get('msg')}",
+                            code=r.get("code"))
+        return r.get("data", {})
+    raise last
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +355,53 @@ def field_meta(table_id):
 
 def field_types(table_id):
     return {n: m["type"] for n, m in field_meta(table_id)["by_name"].items()}
+
+
+# ---------------------------------------------------------------------------
+# Raw field-value coercion (search/batch_get API shapes -> python scalars).
+# Shared by the writer modules; display_value below is for UI rendering.
+# ---------------------------------------------------------------------------
+
+def flat_text(v):
+    """Text out of a search-API field value (segments list / wrapped / plain)."""
+    if isinstance(v, list):
+        return "".join(x.get("text", "") for x in v if isinstance(x, dict)).strip()
+    if isinstance(v, dict):
+        return flat_text(v.get("value")) if "value" in v else ""
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def num_of(v):
+    """Number out of a search-API field value ({'type':2,'value':[n]} / text
+    segments / plain). None when not numeric."""
+    if isinstance(v, dict) and "value" in v:
+        v = v["value"]
+    if isinstance(v, list):
+        if v and isinstance(v[0], dict):   # text-segment list -> flatten first
+            v = flat_text(v)
+        else:
+            v = v[0] if v else None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def link_ids(v):
+    """record_ids inside a duplex-link field value as returned by read APIs."""
+    if isinstance(v, dict):
+        return list(v.get("link_record_ids") or v.get("record_ids") or [])
+    if isinstance(v, list):
+        out = []
+        for x in v:
+            if isinstance(x, dict):
+                out.extend(x.get("link_record_ids") or x.get("record_ids") or [])
+            elif isinstance(x, str):
+                out.append(x)
+        return out
+    return []
 
 
 # ---------------------------------------------------------------------------

@@ -41,7 +41,6 @@ import re
 import json
 import math
 import uuid
-import threading
 import lark_client as lark
 
 # 仓库供应商 → 5.6 预约账号 alias (from config warehouses[].accountAlias /
@@ -51,7 +50,8 @@ ACCOUNT_ALIAS = {"VAST": "元浩", "CAL-5505": "BESTAR"}
 # Serialize commit() across HTTP threads (server is ThreadingHTTPServer):
 # dedup is check-then-write against /records/search, so two concurrent
 # commits for the same ISA would both pass the check and double-create.
-_write_lock = threading.Lock()
+# Shared with appointment_sync.py — ALL webapp writes hold this one lock.
+_write_lock = lark.WRITE_LOCK
 
 # 仓库供应商 → 对应的 5.x 出库计划表（每个供应商一张表）。CAL-5505 走 BESTAR。
 PLAN_TABLES = {
@@ -111,7 +111,7 @@ def map_account(warehouse, valid_accounts):
 
 
 def _t56():
-    return lark.config_values()["tables"]["5.6"]
+    return lark.table_id("5.6")   # env-aware: LARK_ENV=dev -> the dev copy
 
 
 def _base():
@@ -151,7 +151,7 @@ def _link_ids(v):
 
 
 def _t31():
-    return lark.config_values()["tables"]["3.1"]
+    return lark.table_id("3.1")   # env-aware: LARK_ENV=dev -> the dev copy
 
 
 def _flat_text(v):
@@ -429,11 +429,14 @@ def _trip_for_existing(ex_rows, isa, account, plan_table, link56, trip_planned):
     return {"do": "none", "note": "预约账号不同，不补建出库计划"}
 
 
-def _ctoken(*parts):
-    """Deterministic idempotency token: an identical retried batch reuses the
-    same client_token, so an ambiguous failure (client timeout after the
-    server actually wrote) cannot double-create on re-commit."""
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, "larktunnel|" + "|".join(parts)))
+def _ctoken(*_parts):
+    """client_token for a write — a FRESH uuid4 per request.
+    Feishu requires UUID v4 format (1254037) AND rejects tokens replayed
+    across distinct batches even after the records were deleted (1254608,
+    both verified live 2026-07-31). Deduping operator retries is handled by
+    commit() re-planning against fresh reads (existing ISAs are skipped),
+    not by the token — the token only covers transport-level retries."""
+    return str(uuid.uuid4())
 
 
 def commit(records, warehouse):

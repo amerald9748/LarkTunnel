@@ -14,6 +14,15 @@ tags: [workflow, runbook, prompt]
 This note is written so an **agent can execute it deterministically**. Follow the
 steps in order. Do not improvise around the [[Production Guardrails|guardrails]].
 
+> [!tip] Implemented in the webapp (2026-07-31)
+> The **⚡ 预约同步** tab of `webapp/` runs this exact runbook as a batch flow:
+> paste lines → READ-ONLY plan → operator ticks rows → commit with read-back
+> verification. Core logic: `webapp/appointment_sync.py` (`_plan_row()` is the
+> decision tree below; `commit()` documents the 5 write phases). Batch nuance
+> the webapp adds on top of this note: lines sharing an ISA form ONE group —
+> one 5.6 record + one trip, every member linked to that trip; group time
+> conflicts are blocked. Test with `LARK_ENV=dev` (see [[Table Registry]]).
+
 ---
 
 ## 🧭 Operating rules (read first)

@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import lark_client as lark
 import file_parse
 import upload_56
+import appointment_sync
+import sync_jobs
 
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024  # 30 MB of request body
 
@@ -96,9 +98,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True})
             if route == "/api/tables":
                 cfg = lark.config_values()
-                tables = [{"label": lbl, "id": tid} for lbl, tid in cfg["tables"].items()]
+                # In dev mode the 3.1/5.6 labels resolve to the dev copies —
+                # surface the RESOLVED ids so the search tab queries the same
+                # environment the sync tab writes.
+                tables = [{"label": lbl, "id": lark.table_id(lbl)}
+                          for lbl in cfg["tables"]]
                 return self._send_json({"ok": True, "tables": tables,
-                                        "query_fields": QUERY_FIELDS, "tz": lark.tz_label()})
+                                        "query_fields": QUERY_FIELDS,
+                                        "tz": lark.tz_label(), "env": lark.env()})
+            if route == "/api/sync/job":
+                # progress poll — in-process only, NO Feishu I/O
+                jid = (qs.get("id") or [None])[0]
+                if jid == "latest":
+                    job = sync_jobs.latest()
+                else:
+                    job = sync_jobs.get(jid) if jid else None
+                if job is None:
+                    return self._send_json({"ok": False, "error": "unknown job"}, 200)
+                return self._send_json({"ok": True, "job": job})
+            if route == "/api/sync/meta":
+                # UI bootstrap for the 预约同步 tab: warehouse options + env.
+                # trip_enabled reflects the CURRENT env: in dev, only plan
+                # tables with a dev copy can create/link trips.
+                whs = []
+                for key, w in appointment_sync.WAREHOUSES.items():
+                    wiring = appointment_sync._env_wiring(w["plan_table"])
+                    whs.append({"key": key, "account": w["account"],
+                                "plan_table": w["plan_table"],
+                                "mapped": bool(w["plan_table"]),
+                                "trip_enabled": wiring["enabled"],
+                                "label": "卡尔加里 (CAL-5505)" if key == "CAL-5505" else key})
+                return self._send_json({
+                    "ok": True, "env": lark.env(), "warehouses": whs,
+                    "thresholds": {"pallet_diff": appointment_sync.PALLET_DIFF_WARN,
+                                   "trip_cap": appointment_sync.TRIP_PALLET_CAP}})
             if route == "/api/views":
                 table_id = (qs.get("table") or [None])[0]
                 if not table_id:
@@ -199,10 +232,51 @@ class Handler(BaseHTTPRequestHandler):
         it = (res.get("items") or [{}])[0]
         return self._send_json({"ok": True, "target": "5.6 预约表", "item": it})
 
+    # ---- 预约同步 — job-based (both endpoints return a job id at once) -----
+    # plan/commit are chains of dozens of Feishu calls (10-90 s on real
+    # batches); running them inside the request made the button look hung.
+    # The browser polls /api/sync/job for stage / N-of-M / current-row.
+    def _handle_sync_plan(self, payload):
+        warehouse = payload.get("warehouse") or ""
+        text = payload.get("text") or ""
+
+        def run(progress):
+            return appointment_sync.plan(warehouse, text, progress=progress)
+        try:
+            job = sync_jobs.start("plan", run)
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
+        return self._send_json({"ok": True, "job": job})
+
+    def _handle_sync_commit(self, payload):
+        warehouse = payload.get("warehouse") or ""
+        text = payload.get("text") or ""
+        approvals = payload.get("approvals") or []
+        client_env = payload.get("env") or ""
+
+        # env mismatch must fail the SUBMISSION, not the background job
+        if client_env != lark.env():
+            return self._send_json(
+                {"ok": False, "error": f"环境不匹配：页面为 {client_env}，"
+                                       f"服务端为 {lark.env()} — 请刷新页面"}, 200)
+
+        def run(progress):
+            return appointment_sync.commit(warehouse, text, approvals,
+                                           client_env, progress=progress)
+        try:
+            job = sync_jobs.start("commit", run)
+        except sync_jobs.Busy as e:
+            # single-flight: refuse loudly instead of queueing invisibly
+            return self._send_json({"ok": False, "busy": True, "error": str(e)}, 200)
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
+        return self._send_json({"ok": True, "job": job})
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path not in ("/api/query", "/api/parse", "/api/upload",
-                               "/api/dryrun_56", "/api/commit_56"):
+                               "/api/dryrun_56", "/api/commit_56",
+                               "/api/sync/plan", "/api/sync/commit"):
             return self.send_error(404, "Not found")
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -220,6 +294,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_dryrun56(payload)
         if parsed.path == "/api/commit_56":
             return self._handle_commit56(payload)
+        if parsed.path == "/api/sync/plan":
+            return self._handle_sync_plan(payload)
+        if parsed.path == "/api/sync/commit":
+            return self._handle_sync_commit(payload)
 
         table_id = payload.get("table")
         view_id = payload.get("view_id") or None
@@ -281,7 +359,10 @@ def main():
     # Fail fast with a clear message if config/secrets are unreadable.
     try:
         cfg = lark.config_values()
-        print(f"[LarkTunnel] base={cfg['base_token']}  tables={list(cfg['tables'])}")
+        print(f"[LarkTunnel] env={lark.env().upper()}  base={cfg['base_token']}  "
+              f"tables={list(cfg['tables'])}")
+        if lark.env() == "dev":
+            print(f"[LarkTunnel] DEV MODE — 3.1/5.6 resolve to {cfg['dev_tables']}")
     except lark.LarkError as e:
         print(f"[LarkTunnel] CONFIG ERROR: {e}")
     try:
