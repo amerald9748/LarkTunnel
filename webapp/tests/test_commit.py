@@ -144,6 +144,34 @@ class TestCommitPhases(CommitCase):
         row = next(r for r in res["rows"] if r.get("approved"))
         self.assertTrue(row["commit"]["verified"])
 
+    def test_relink_commits_and_readback_verifies(self):
+        # newest-wins: pasted ISA exists on ANOTHER 5.6 record -> the trip's
+        # 预约信息 is repointed there (+ its time updated); NO 5.6 create, and
+        # the previously linked record is left untouched.
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=9903350996, time="2026/07/30 15:00"),
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
+        planned = sync.plan("VAST", LINE_A)
+        res = sync.commit("VAST", LINE_A, self.approve_all(planned), "prod")
+
+        kinds = [(k, t) for k, t, _, _ in self.fx.calls]
+        self.assertEqual(kinds, [("update", T54), ("update", T56)])
+        # the trip now points at 'other'
+        self.assertEqual(self.fx.trips["trip1"]["预约信息"]["link_record_ids"],
+                         ["other"])
+        # the TARGET record got the pasted time; the old record is untouched
+        upd56 = next(p for k, t, p, _ in self.fx.calls if t == T56)
+        self.assertEqual(upd56["records"][0]["record_id"], "other")
+        linked = next(r for r in self.fx.rows56 if r["record_id"] == "linked")
+        self.assertEqual(linked["fields"]["ISA"], 1111111111)
+        row = next(r for r in res["rows"] if r.get("approved"))
+        self.assertTrue(row["commit"]["verified"], row["commit"]["checks"])
+        self.assertTrue(any(c["what"] == "出库计划改挂预约" and c["ok"]
+                            for c in row["commit"]["checks"]))
+
     def test_partial_approval_writes_only_approved(self):
         self.fx.rows31 = [make_31("a"), make_31("b", awb="TCNU4251020B", dest="YVR2")]
         text = "OOCU9020713B YVR2 4 141\nTCNU4251020B YVR2 1 4"

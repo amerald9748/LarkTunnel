@@ -610,7 +610,10 @@ def _plan_row(ctx, p):
         fill_pallets     {record_id, value}
         update_isa_time  {isa_record_id, isa, time}         (4A mismatch)
         link_trip        {record_id, plan_link_field, trip_id|'@group'}
-        set_trip_isa     {trip_id, isa_record_id}   (edge: 出库计划 w/o 预约)
+        set_trip_isa     {trip_id, isa_record_id, mode}
+                         mode='attach': 出库计划 had no 预约 (edge)
+                         mode='relink': newest-wins — repoint the 出库计划 to
+                         an EXISTING 5.6 record carrying the pasted ISA
         create_trip      {group_isa}   -> one 5.x 出库计划 per ISA GROUP
     '@group' resolves at commit time to the 出库计划 record created for that
     ISA group (see commit() phases). NOTE: no create_isa action exists —
@@ -762,7 +765,8 @@ def _plan_row(ctx, p):
                 if ex:
                     if ex["multi"]:
                         W(f"5.6 中 ISA {p['isa']} 存在多条，按最匹配的一条处理")
-                    row["actions"].append({"type": "set_trip_isa", "trip_id": trip_id,
+                    row["actions"].append({"type": "set_trip_isa", "mode": "attach",
+                                           "trip_id": trip_id,
                                            "isa_record_id": ex["rec_id"]})
                     _check_time_update(row, ctx, ex, p, W)
                 else:
@@ -791,25 +795,43 @@ def _plan_row(ctx, p):
         if same_isa and same_time:
             row["plan"]["status"] = "has_plan_match"
             N("派送计划的 ISA+时间与提供值一致 — 无需改动")
+            return row
+
+        # 4A mismatch — NEWEST-WINS (operator-specified 2026-08-05): the
+        # current paste overwrites the previous plan. Three sub-cases, all
+        # keeping the ISA-uniqueness invariant of 5.6:
+        #   (a) same ISA, new time     -> update the linked record's time
+        #   (b) new ISA that EXISTS as another 5.6 record -> RELINK the
+        #       出库计划's 预约信息 to that record (never rewrite the old one —
+        #       that would duplicate the ISA; this replaced the old blocker).
+        #       The relink propagates to 3.1 via the 5.x ISA/预约时间 formulas.
+        #       If the target record's stored time differs from the paste,
+        #       its 复制时间列 is updated too.
+        #   (c) brand-new ISA (nowhere in 5.6) -> rewrite the linked record
+        #       in place with the new ISA + time (a reschedule keeps its row).
+        # ⚠ All three affect every shipment on the same 出库计划 — intended:
+        #   the whole trip goes to one appointment.
+        row["plan"]["status"] = "has_plan_mismatch"
+        other = None if same_isa else _resolve_isa(ctx, p["isa"])
+        if other and other["rec_id"] != isa_rec_id:
+            # -- (b) relink to the existing target appointment --------------
+            if other["multi"]:
+                W(f"5.6 中 ISA {p['isa']} 存在多条，改挂到最匹配的一条")
+            row["actions"].append({"type": "set_trip_isa", "mode": "relink",
+                                   "trip_id": trip_id,
+                                   "isa_record_id": other["rec_id"]})
+            other_time = norm_time(lark.flat_text(other["fields"].get(F56["time"])))
+            if other_time != p["time"]:
+                row["actions"].append({"type": "update_isa_time",
+                                       "isa_record_id": other["rec_id"],
+                                       "isa": p["isa"], "time": p["time"]})
+            W(f"派送计划不一致（现 ISA={_n(cur_isa)} → 新 ISA={p['isa']}，"
+              f"该 ISA 已存在于 5.6）— 将把出库计划改挂到该预约"
+              + (f"，并把其时间 {other_time or '空'} 更新为 {p['time']}"
+                 if other_time != p["time"] else "")
+              + f"；原预约（ISA={_n(cur_isa)}）保留不动。影响该出库计划下所有货件")
         else:
-            # 4A mismatch: EDIT THE LINKED 5.6 RECORD to the session values
-            # (runbook 4A — a rescheduled appointment keeps its record).
-            # ⚠ This updates the appointment itself, so it propagates to every
-            #   other shipment on the same 出库计划.
-            row["plan"]["status"] = "has_plan_mismatch"
-            # GUARD — ISA uniqueness. If the pasted ISA already exists as a
-            # DIFFERENT 5.6 record, rewriting this record's ISA to it would
-            # put the same ISA on two records. Refuse; re-pointing a shipment
-            # to another appointment is a link change, not an ISA edit.
-            if not same_isa:
-                other = _resolve_isa(ctx, p["isa"])
-                if other and other["rec_id"] != isa_rec_id:
-                    row["blockers"].append(
-                        f"ISA {p['isa']} 已存在于另一条预约记录（{other['rec_id']}）— "
-                        f"不能把当前预约（ISA {_n(cur_isa)}）改成它，否则 5.6 会出现"
-                        f"重复 ISA。请先在飞书里把该货件从当前出库计划移出，"
-                        f"再挂到目标预约的出库计划")
-                    return row
+            # -- (a) time-only update / (c) in-place rewrite to a new ISA ---
             row["actions"].append({"type": "update_isa_time",
                                    "isa_record_id": isa_rec_id,
                                    "isa": p["isa"], "time": p["time"]})
@@ -940,7 +962,9 @@ def commit(warehouse, text, approvals, client_env, progress=None):
       1. batch_create 5.x      — one 出库计划 per approved ISA group, created
                                  WITH its 预约信息 duplex link pointing at the
                                  EXISTING 5.6 record (back-link fills itself)
-      2. batch_update 5.x      — set_trip_isa edge rows (出库计划 w/o 预约)
+      2. batch_update 5.x      — set_trip_isa rows: attach a 预约 to a bare
+                                 出库计划, or RELINK it to an existing 5.6
+                                 record (newest-wins ISA change)
       3. batch_update 3.1      — per row: 实际板数 fill + plan link, ONE update
                                  per record (link写在 3.1 侧 => 5.x 库存信息
                                  back-link fills itself, both environments)
@@ -1154,7 +1178,7 @@ def _commit_locked(warehouse, text, approvals, tick):
 
     # ---- Phase 5: read-back verification ----------------------------------
     tick(stage="核实 · 回读校验写入结果")
-    _verify(rows, t31, t56, group_trip_rec)
+    _verify(rows, t31, t56, group_trip_rec, t5x, isa_field)
     tick(stage="完成", current="")
 
     # Roll up the end-of-run warning list the operator asked for.
@@ -1167,7 +1191,7 @@ def _commit_locked(warehouse, text, approvals, tick):
     return result
 
 
-def _verify(rows, t31, t56, group_trip_rec):
+def _verify(rows, t31, t56, group_trip_rec, t5x=None, isa_field=None):
     """Re-read the records we just wrote and confirm every value landed.
     Marks each committed row verified=True/False with details — the UI shows
     this, and the integration tests assert on it."""
@@ -1180,6 +1204,15 @@ def _verify(rows, t31, t56, group_trip_rec):
         link_cols = {a["plan_link_field"] for r in rows for a in r["actions"]
                      if a["type"] == "link_trip"}
         fields31 = _batch_get(t31, rids31, [F31["actual"], *link_cols])
+    # trips whose 预约信息 we set/relinked -> real read-back, not just call-ok
+    trip_ids = {a["trip_id"] for r in rows for a in r["actions"]
+                if a["type"] == "set_trip_isa"
+                and (r.get("commit") or {}).get("trip_isa_set")}
+    trip_links = {}
+    if trip_ids and t5x and isa_field:
+        got = _batch_get(t5x, list(trip_ids), [isa_field])
+        trip_links = {tid: lark.link_ids(f.get(isa_field))
+                      for tid, f in got.items()}
     rids56 = set()
     for r in rows:
         c = r.get("commit") or {}
@@ -1216,7 +1249,14 @@ def _verify(rows, t31, t56, group_trip_rec):
                 checks.append(("新建出库计划", bool(c.get("trip_record_id")),
                                c.get("trip_record_id") or "无"))
             elif a["type"] == "set_trip_isa":
-                checks.append(("出库计划挂预约", bool(c.get("trip_isa_set")), ""))
+                got = trip_links.get(a["trip_id"])
+                if got is not None:              # real read-back when possible
+                    label = ("出库计划改挂预约" if a.get("mode") == "relink"
+                             else "出库计划挂预约")
+                    checks.append((label, a["isa_record_id"] in got,
+                                   ",".join(got) or "空"))
+                else:
+                    checks.append(("出库计划挂预约", bool(c.get("trip_isa_set")), ""))
         c["done"] = True
         c["verified"] = all(ok for _, ok, _ in checks) if checks else True
         c["checks"] = [{"what": w, "ok": ok, "got": g} for w, ok, g in checks]

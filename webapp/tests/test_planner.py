@@ -352,21 +352,41 @@ class TestStep4BNoPlan(PlannerCase):
             row = self.plan1(line)
             self.assertNotIn("create_isa", self.action_types(row))
 
-    def test_isa_rewrite_blocked_when_target_isa_exists_elsewhere(self):
-        """4A mismatch rewrites the linked 5.6 record's ISA. If the pasted ISA
-        already lives on ANOTHER record, that would duplicate it in 5.6 —
-        must block instead."""
+    def test_new_isa_existing_elsewhere_relinks_trip(self):
+        """4A mismatch, pasted ISA lives on ANOTHER 5.6 record (newest-wins,
+        operator-specified 2026-08-05): RELINK the 出库计划's 预约信息 to that
+        record instead of rewriting the linked one (which would duplicate the
+        ISA — the old behavior blocked here). Target's stored time differs
+        from the paste -> its 复制时间列 is updated too."""
         self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
         self.fx.rows56 = [
             make_56("linked", isa=1111111111, trip_links=["trip1"]),
-            make_56("other", isa=7403350996),          # the pasted ISA, elsewhere
+            make_56("other", isa=7403350996, time="2026/07/30 15:00"),
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
+        row = self.plan1(LINE_FULL)          # pastes 7403350996 @ 07/30 13:00
+        self.assertEqual(row["plan"]["status"], "has_plan_mismatch")
+        self.assertEqual(row["blockers"], [])
+        relink = next(a for a in row["actions"] if a["type"] == "set_trip_isa")
+        self.assertEqual(relink["mode"], "relink")
+        self.assertEqual(relink["trip_id"], "trip1")
+        self.assertEqual(relink["isa_record_id"], "other")
+        upd = next(a for a in row["actions"] if a["type"] == "update_isa_time")
+        self.assertEqual(upd["isa_record_id"], "other")     # target, NOT linked
+        self.assertEqual(upd["time"], "2026/07/30 13:00")
+        self.assertTrue(any("改挂" in w for w in row["warnings"]))
+
+    def test_relink_without_time_update_when_target_time_matches(self):
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=7403350996, time="2026/07/30 13:00"),  # matches paste
         ]
         self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
         row = self.plan1(LINE_FULL)
-        self.assertEqual(row["plan"]["status"], "has_plan_mismatch")
-        self.assertTrue(row["blockers"])
-        self.assertIn("重复 ISA", row["blockers"][0])
-        self.assertNotIn("update_isa_time", self.action_types(row))
+        types = self.action_types(row)
+        self.assertIn("set_trip_isa", types)
+        self.assertNotIn("update_isa_time", types)   # nothing to change on target
 
     def test_isa_rewrite_allowed_when_target_isa_is_new(self):
         # same shape, but the pasted ISA exists nowhere -> in-place reschedule
