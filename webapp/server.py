@@ -20,8 +20,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import lark_client as lark
 import file_parse
-import upload_56
 import appointment_sync
+import appointment_create
+import verify_assignments
 import sync_jobs
 
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024  # 30 MB of request body
@@ -128,8 +129,18 @@ class Handler(BaseHTTPRequestHandler):
                                 "mapped": bool(w["plan_table"]),
                                 "trip_enabled": wiring["enabled"],
                                 "label": "卡尔加里 (CAL-5505)" if key == "CAL-5505" else key})
+                # LIVE 5.6 目的地 options (5-min cached in field_meta) — the UI
+                # validates destinations against THIS list, never a hardcoded
+                # pattern, so options added in Lark work immediately.
+                try:
+                    fm = lark.field_meta(lark.table_id("5.6"))["by_name"]
+                    dests = sorted(((fm.get("目的地") or {}).get("options") or {})
+                                   .values())
+                except lark.LarkError:
+                    dests = []          # meta still loads; client falls back
                 return self._send_json({
                     "ok": True, "env": lark.env(), "warehouses": whs,
+                    "dest_options": dests,
                     "thresholds": {"pallet_diff": appointment_sync.PALLET_DIFF_WARN,
                                    "trip_cap": appointment_sync.TRIP_PALLET_CAP}})
             if route == "/api/views":
@@ -190,48 +201,6 @@ class Handler(BaseHTTPRequestHandler):
             "warehouse_options": wh_opts,
         })
 
-    # ---- 5.6 dry-run (READ-ONLY manifest) ---------------------------------
-    def _handle_dryrun56(self, payload):
-        records = payload.get("records") or []
-        warehouse = payload.get("warehouse") or ""
-        try:
-            res = upload_56.plan(records, warehouse)
-        except lark.LarkError as e:
-            return self._send_json({"ok": False, "error": str(e)}, 200)
-        except Exception as e:  # noqa
-            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
-        return self._send_json({"ok": True, "dryrun": True, "target": "5.6 预约表", **res})
-
-    # ---- 5.6 commit (WRITES the actionable creates) -----------------------
-    def _handle_commit56(self, payload):
-        records = payload.get("records") or []
-        warehouse = payload.get("warehouse") or ""
-        try:
-            res = upload_56.commit(records, warehouse)
-        except lark.LarkError as e:
-            return self._send_json({"ok": False, "error": str(e)}, 200)
-        except Exception as e:  # noqa
-            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
-        return self._send_json({"ok": True, "committed": True, "target": "5.6 预约表", **res})
-
-    # ---- upload ONE record to 5.6 (guarded single create) -----------------
-    def _handle_upload(self, payload):
-        rec = payload.get("record") or {}
-        warehouse = payload.get("warehouse") or ""
-        if not (rec.get("awb") or "").strip():
-            return self._send_json({"ok": False, "error": "该记录没有柜号，无法上传"}, 200)
-        try:
-            res = upload_56.commit([rec], warehouse)
-        except lark.LarkError as e:
-            msg = str(e)
-            hint = ("（App 可能没有该 Base 的编辑权限）"
-                    if any(k in msg.lower() for k in ("permission", "forbidden")) else "")
-            return self._send_json({"ok": False, "error": f"写入失败: {msg}{hint}"}, 200)
-        except Exception as e:  # noqa
-            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
-        it = (res.get("items") or [{}])[0]
-        return self._send_json({"ok": True, "target": "5.6 预约表", "item": it})
-
     # ---- 预约同步 — job-based (both endpoints return a job id at once) -----
     # plan/commit are chains of dozens of Feishu calls (10-90 s on real
     # batches); running them inside the request made the button look hung.
@@ -272,11 +241,63 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
         return self._send_json({"ok": True, "job": job})
 
+    # ---- 新建预约（仅 5.6）— same job pattern as the sync flow -------------
+    def _handle_create56_plan(self, payload):
+        warehouse = payload.get("warehouse") or ""
+        text = payload.get("text") or ""
+
+        def run(progress):
+            return appointment_create.plan(warehouse, text, progress=progress)
+        try:
+            job = sync_jobs.start("plan", run)
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
+        return self._send_json({"ok": True, "job": job})
+
+    def _handle_create56_commit(self, payload):
+        warehouse = payload.get("warehouse") or ""
+        text = payload.get("text") or ""
+        approvals = payload.get("approvals") or []
+        client_env = payload.get("env") or ""
+        if client_env != lark.env():
+            return self._send_json(
+                {"ok": False, "error": f"环境不匹配：页面为 {client_env}，"
+                                       f"服务端为 {lark.env()} — 请刷新页面"}, 200)
+
+        def run(progress):
+            return appointment_create.commit(warehouse, text, approvals,
+                                             client_env, progress=progress)
+        try:
+            # kind 'commit' => single-flight ACROSS both write flows
+            job = sync_jobs.start("commit", run)
+        except sync_jobs.Busy as e:
+            return self._send_json({"ok": False, "busy": True, "error": str(e)}, 200)
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
+        return self._send_json({"ok": True, "job": job})
+
+    # ---- ③核对 (READ-ONLY audit of the finished assignments) ---------------
+    def _handle_verify(self, payload):
+        warehouse = payload.get("warehouse") or ""
+        text = payload.get("text") or ""
+
+        def run(progress):
+            return verify_assignments.verify(warehouse, text, progress=progress)
+        try:
+            job = sync_jobs.start("plan", run)   # 'plan' kind = read-only
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
+        return self._send_json({"ok": True, "job": job})
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path not in ("/api/query", "/api/parse", "/api/upload",
-                               "/api/dryrun_56", "/api/commit_56",
-                               "/api/sync/plan", "/api/sync/commit"):
+        # NOTE: /api/upload · /api/dryrun_56 · /api/commit_56 were RETIRED
+        # 2026-08-04 — upload_56.py was a third writer of 5.6 + 出库计划,
+        # overlapping ①新建预约 / ②计划同步. 文件解析 is parse-only now.
+        if parsed.path not in ("/api/query", "/api/parse",
+                               "/api/sync/plan", "/api/sync/commit",
+                               "/api/create56/plan", "/api/create56/commit",
+                               "/api/verify"):
             return self.send_error(404, "Not found")
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -288,16 +309,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/parse":
             return self._handle_parse(payload)
-        if parsed.path == "/api/upload":
-            return self._handle_upload(payload)
-        if parsed.path == "/api/dryrun_56":
-            return self._handle_dryrun56(payload)
-        if parsed.path == "/api/commit_56":
-            return self._handle_commit56(payload)
         if parsed.path == "/api/sync/plan":
             return self._handle_sync_plan(payload)
         if parsed.path == "/api/sync/commit":
             return self._handle_sync_commit(payload)
+        if parsed.path == "/api/create56/plan":
+            return self._handle_create56_plan(payload)
+        if parsed.path == "/api/create56/commit":
+            return self._handle_create56_commit(payload)
+        if parsed.path == "/api/verify":
+            return self._handle_verify(payload)
 
         table_id = payload.get("table")
         view_id = payload.get("view_id") or None

@@ -1,5 +1,18 @@
 # -*- coding: utf-8 -*-
 """
+⛔ RETIRED 2026-08-04 — NOT IMPORTED BY THE APP. DO NOT RE-WIRE.
+
+    This module used to create 5.6 appointments AND 5.x 出库计划 records from
+    a parsed spreadsheet, which made it a THIRD writer of those tables next to
+    appointment_create.py（①新建预约）and appointment_sync.py（②计划同步）—
+    exactly the overlap the operator asked to eliminate. Its endpoints
+    (/api/upload, /api/dryrun_56, /api/commit_56) and its UI buttons are gone;
+    the 文件解析 tab now only parses and hands rows to ①/②.
+
+    Kept on disk for reference only (the 实际板数 reconciliation rules and the
+    conflict/dup handling were ported into appointment_sync). If you need
+    file-driven bulk work, extend the owning module instead of importing this.
+
 upload_56.py — plan & commit appointment records into the 5.6 预约表.
 
 Every write is guarded:

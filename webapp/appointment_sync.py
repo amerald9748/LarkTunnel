@@ -1,7 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-appointment_sync.py — 到仓核对 & 预约/派送计划同步（batch, explicit-commit）
+appointment_sync.py — ②计划同步：到仓板数核对 + 3.1↔出库计划↔预约 接线
 ================================================================================
+
+OWNERSHIP (one writer per table — do not blur this)
+    ①新建预约 (appointment_create.py) CREATES 5.6 appointment records.
+    ②计划同步 (this module) NEVER creates 5.6 records. It writes:
+        · 3.1 实际板数 (fill only, never overwrite)
+        · 3.1 ↔ 5.x 出库计划 duplex links (create the 出库计划 record if the
+          appointment doesn't have one yet, then attach the shipment)
+        · UPDATES ISA/时间 on an ALREADY-LINKED 5.6 record when the pasted
+          appointment differs (a reschedule)
+    A line whose ISA is not in 5.6 is BLOCKED with a pointer back to ①.
+    ③核对 (verify_assignments.py) only reads.
 
 Implements `docs/40 Workflows/Appointment Sync Runbook.md` as the webapp's
 primary flow:
@@ -22,10 +33,11 @@ INPUT FORMAT (one shipment per line, whitespace/tab separated)
   * The optional tail must be BOTH the ISA and the appointment time —
     one without the other is rejected (nothing could be safely done with it).
   * The TZ token (PDT/MDT/...) is accepted and shown, but NOT stored:
-    5.6 复制时间列 stores plain text 'YYYY/MM/DD HH:MM' (verified against
-    live rows 2026-07-31) with no timezone, so the clock time is written and
-    compared as-is. If two sources quote different timezones for the same
-    appointment, the operator must reconcile manually.
+    5.6 复制时间列 stores plain text 'MM/DD/YYYY HH:MM' (operator-specified
+    2026-08-04; legacy rows also hold 'YYYY/MM/DD HH:MM' — norm_time()
+    canonicalizes both for comparison) with no timezone, so the clock time
+    is written and compared as-is. If two sources quote different timezones
+    for the same appointment, the operator must reconcile manually.
 
 CORE LOGIC MAP (for review)
 ---------------------------
@@ -34,9 +46,10 @@ CORE LOGIC MAP (for review)
     _plan_row()    — the per-row decision tree (runbook steps 2–4):
                        step 2: unique 3.1 row by 柜号+路线+仓库
                        step 3: 实际板数 fill-if-empty (+W1/W2 warnings)
-                       step 4: delivery-plan wiring (4A match/mismatch,
-                               4B link / create-trip / create-ISA+trip)
-    commit()       — executes approved rows in 5 phases (see banner below)
+                       step 4: 出库计划 wiring (4A match/mismatch,
+                               4B link-existing / create-出库计划 /
+                               BLOCK when the ISA isn't in 5.6 yet)
+    commit()       — executes approved rows in 4 phases (see banner below)
 
 ENVIRONMENTS
 ------------
@@ -52,9 +65,8 @@ SAFETY
     * commit() re-plans from scratch and compares each row's action
       signature against what the operator approved — if the Base changed
       in between, the row is SKIPPED with "情况已变化", never blind-written.
-    * All writes hold lark.WRITE_LOCK (process-wide serialization) and send
-      deterministic client_tokens, so an ambiguous network failure that is
-      retried cannot double-create records.
+    * All writes hold lark.WRITE_LOCK (process-wide serialization), shared
+      with ①新建预约 — the two flows can never write concurrently.
 """
 
 import re
@@ -88,7 +100,11 @@ F31 = {
 }
 F56 = {
     "isa": "ISA",                 # Number
-    "time": "复制时间列",          # Text 'YYYY/MM/DD HH:MM'
+    "time": "复制时间列",          # Text — STORED as 'MM/DD/YYYY HH:MM'
+    #                               (operator-specified 2026-08-04). Legacy
+    #                               rows also contain 'YYYY/MM/DD HH:MM';
+    #                               all comparisons go through norm_time(),
+    #                               which canonicalizes BOTH formats.
     "dest": "目的地",              # SingleSelect (only ~23 live options!)
     "account": "预约账号",         # SingleSelect
 }
@@ -119,7 +135,12 @@ LINK_ON_56 = {
 PALLET_DIFF_WARN = 2   # |提供板数 - 预计板数| > 2  => W1/W2 warning
 TRIP_PALLET_CAP = 28   # trip total pallets > 28    => W3 warning
 
-DEST_RE = re.compile(r"^(YEG|YYC|YVR)[1-9]$")      # the routes this tool serves
+# Destination SHAPE check only (uppercase code like YEG2 / XCAB / YYX2).
+# The AUTHORITATIVE list is the live 5.6 目的地 select options, checked at
+# plan time — never a hardcoded list here, so new bays/codes added in Lark
+# work without touching any config or code. (Was ^(YEG|YYC|YVR)[1-9]$, which
+# wrongly rejected the live option XCAB — reported by the operator 2026-08-04.)
+DEST_RE = re.compile(r"^[A-Z][A-Z0-9•\-]{1,7}$")
 ISA_RE = re.compile(r"^\d{8,15}$")                  # live ISAs are 9–12 digits
 AWB_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{4,}$")   # container / AWB, loose sanity
 TIME_RE = re.compile(  # 'MM/DD/YYYY HH:MM' or 'YYYY/MM/DD HH:MM', '-' or '/'
@@ -152,6 +173,19 @@ def norm_time(s):
     if not (1 <= mo <= 12 and 1 <= d <= 31 and 0 <= int(hh) <= 23):
         return None
     return f"{y}/{mo:02d}/{d:02d} {int(hh):02d}:{mi}"
+
+
+def store_time(norm):
+    """Internal canonical 'YYYY/MM/DD HH:MM' -> the STORAGE format for
+    复制时间列: 'MM/DD/YYYY HH:MM' (operator-specified 2026-08-04 — the
+    downstream 5.6 formulas expect month-first; earlier code stored
+    year-first, which broke them).
+
+    Only the two WRITE sites use this. Reads/comparisons keep using
+    norm_time(), which canonicalizes month-first, year-first and the legacy
+    rows alike — so mixed historical data still compares correctly."""
+    m = re.match(r"^(\d{4})/(\d{2})/(\d{2}) (\d{2}:\d{2})$", norm or "")
+    return f"{m.group(2)}/{m.group(3)}/{m.group(1)} {m.group(4)}" if m else norm
 
 
 def parse_line(raw):
@@ -192,7 +226,7 @@ def parse_line(raw):
     if not AWB_RE.match(awb):
         return {"error": f"柜号「{toks[0]}」格式不像柜号/AWB"}
     if not DEST_RE.match(dest):
-        return {"error": f"路线「{toks[1]}」不合法 — 只接受 YEG1-9 / YYC1-9 / YVR1-9"}
+        return {"error": f"路线「{toks[1]}」格式不像仓点代码（如 YEG2 / XCAB）"}
 
     # The two trailing numbers of the basic form are [实际板数, 箱数] — BOTH
     # must be plain positive integers. A ≥9-digit number here almost certainly
@@ -207,8 +241,8 @@ def parse_line(raw):
     pallets, boxes = int(pallets_s), int(boxes_s)
     if pallets < 1 or pallets > 99:
         return {"error": f"实际板数 {pallets} 超出合理范围 (1-99)"}
-    if boxes < 1:
-        return {"error": "箱数必须大于 0"}
+    # 箱数 0 is REAL data (loose/overflow shipments carry no cartons) and is
+    # also a disambiguation key for split rows — never reject it.
 
     isa = time_norm = tz = None
     if len(toks) >= 7:                       # full form with appointment info
@@ -231,22 +265,19 @@ def parse_line(raw):
 
 
 def parse_batch(text):
-    """Split pasted text into parsed lines (skipping blank lines) and refuse
-    in-batch duplicates of the same 柜号+路线 — two lines writing one 3.1 row
-    would conflict."""
-    rows, seen = [], {}
+    """Split pasted text into parsed lines (skipping blank lines).
+
+    Repeated 柜号+路线 lines are ALLOWED: a split shipment legitimately has
+    several 3.1 rows for the same container+destination, and the per-line
+    板数/箱数 tell them apart (see _disambiguate_31). The thing that must
+    never happen — two lines writing ONE 3.1 record — is guarded at plan
+    level instead, where the actual matched record ids are known."""
+    rows = []
     for i, raw in enumerate((text or "").splitlines()):
         if not raw.strip():
             continue
         p = parse_line(raw)
         p["line_no"] = i + 1
-        key = (p.get("awb"), p.get("dest"))
-        if "error" not in p:
-            if key in seen:
-                p = {"raw": raw, "line_no": i + 1,
-                     "error": f"与第 {seen[key]} 行重复（同柜号+路线）— 请删去一行"}
-            else:
-                seen[key] = i + 1
         rows.append(p)
     return rows
 
@@ -294,8 +325,12 @@ def _find_31(t31, awb, route, warehouse, plan_link_31=None):
     """3.1 rows for 柜号+路线+仓库. Exact 柜号 first; fall back to a contains
     search tightened to prefix+1char matches (拆柜后缀 …A/…B), same rule as
     upload_56._find_31. READ."""
-    fields = [F31["awb"], F31["actual"], F31["estimated"], F31["boxes"],
-              F31["batch"], F31["plan_formula"]]
+    # 目的地路线 is requested even though it is a search CONDITION here: ③核对
+    # reads it back off the row to detect a wrong-bay assignment (appointment
+    # 目的地 vs the row's 目的地路线). Omitting it made that check silently
+    # no-op (caught by integration_workflow 2026-08-04).
+    fields = [F31["awb"], F31["route"], F31["actual"], F31["estimated"],
+              F31["boxes"], F31["batch"], F31["plan_formula"]]
     if plan_link_31:
         fields.append(plan_link_31)              # env's 3.1-side plan link field
 
@@ -315,6 +350,44 @@ def _find_31(t31, awb, route, warehouse, plan_link_31=None):
         hits = [h for h in go("contains", awb)
                 if pat.fullmatch(lark.flat_text((h.get("fields") or {}).get(F31["awb"])))]
     return hits
+
+
+def _disambiguate_31(hits, pallets, boxes):
+    """Pick ONE row out of several 3.1 rows sharing 柜号+路线+仓库.
+
+    Split shipments make such duplicates legitimate (one container feeding
+    the same destination in two physical deliveries). The pasted line carries
+    板数 + 箱数, which per the operator uniquely identify the shipment.
+    Matching order (operator-specified 2026-08-04: compare the numbers THEY
+    provide against the numbers ON FEISHU — 箱数 and 实际板数, never 预计板数):
+
+      1. 箱数 equality (the line's box count vs the row's 箱数 column;
+         0 and empty are the same "no cartons"). This tool never writes
+         箱数, so the key is stable.
+      2. Among box-count survivors: 板数 — the line's count vs the row's
+         实际板数 column (numeric; empty never matches). Self-consistent
+         across re-runs: commit writes exactly the provided number into
+         实际板数, so a replan re-matches the same row.
+
+    Returns (row, 依据) on a UNIQUE match, else (None, None) — the caller
+    keeps the row ambiguous rather than guessing."""
+    def row_boxes(h):
+        v = lark.num_of((h.get("fields") or {}).get(F31["boxes"]))
+        return int(v) if v is not None else 0        # empty == 0 cartons
+
+    def row_actual(h):
+        return lark.num_of(lark.flat_text((h.get("fields") or {}).get(F31["actual"])))
+
+    c1 = [h for h in hits if row_boxes(h) == int(boxes or 0)]
+    if len(c1) == 1:
+        return c1[0], "箱数"
+    if not c1:
+        return None, None      # the line's 箱数 matches NO row — don't guess
+    c2 = [h for h in c1 if row_actual(h) is not None
+          and float(row_actual(h)) == float(pallets)]
+    if len(c2) == 1:
+        return c2[0], "箱数+板数"
+    return None, None
 
 
 def _env_wiring(plan_table):
@@ -440,9 +513,6 @@ def plan(warehouse, text, progress=None):
 
     def plan_one(p):
         r = _plan_row(ctx, p)
-        # The signature freezes what the operator approves; commit() recomputes
-        # it from fresh reads and refuses rows whose situation changed.
-        r["sig"] = _sig(r["actions"])
         with count_lock:
             done_count["n"] += 1
             awb = (r.get("parsed") or {}).get("awb") or ""
@@ -455,6 +525,28 @@ def plan(warehouse, text, progress=None):
     else:
         with ThreadPoolExecutor(max_workers=PLAN_WORKERS) as pool:
             rows = list(pool.map(plan_one, parsed))   # map preserves order
+
+    # SAME-RECORD GUARD — two lines must never write one 3.1 row. Possible
+    # when 箱数/预计板数 fail to tell split rows apart and both lines
+    # disambiguate onto the same record: refuse BOTH, never pick a winner.
+    by_rid = {}
+    for r in rows:
+        rid = (r.get("match") or {}).get("record_id")
+        if rid and not r.get("match_error"):
+            by_rid.setdefault(rid, []).append(r)
+    for rid, rs in by_rid.items():
+        if len(rs) > 1:
+            nos = "/".join(str(x["line_no"]) for x in rs)
+            for x in rs:
+                x["blockers"].append(
+                    f"第 {nos} 行匹配到同一条 3.1 记录 — 两行不能写同一行，"
+                    f"请核对各自的板数/箱数后重试")
+
+    # The signature freezes what the operator approves; commit() recomputes
+    # it from fresh reads and refuses rows whose situation changed. Computed
+    # AFTER the guard so blockers are part of the reviewed state.
+    for r in rows:
+        r["sig"] = _sig(r["actions"])
 
     summary = {
         "lines": len(rows),
@@ -518,11 +610,11 @@ def _plan_row(ctx, p):
         fill_pallets     {record_id, value}
         update_isa_time  {isa_record_id, isa, time}         (4A mismatch)
         link_trip        {record_id, plan_link_field, trip_id|'@group'}
-        set_trip_isa     {trip_id, isa_record_id|'@group'}  (edge: trip w/o ISA)
-        create_isa       {group_isa}   -> one 5.6 create per ISA GROUP
-        create_trip      {group_isa}   -> one 5.x create per ISA GROUP
-    '@group' placeholders resolve at commit time to the group's materialized
-    record ids (see commit() phases)."""
+        set_trip_isa     {trip_id, isa_record_id}   (edge: 出库计划 w/o 预约)
+        create_trip      {group_isa}   -> one 5.x 出库计划 per ISA GROUP
+    '@group' resolves at commit time to the 出库计划 record created for that
+    ISA group (see commit() phases). NOTE: no create_isa action exists —
+    appointments come from ①新建预约 only."""
     row = {"line_no": p.get("line_no"), "raw": p.get("raw"),
            "parsed": None, "parse_error": None, "match": None,
            "match_error": None, "pallet": {}, "boxes": {}, "plan": {},
@@ -549,9 +641,20 @@ def _plan_row(ctx, p):
         row["match_error"] = "3.1 无匹配行（柜号+路线+仓库）"
         return row
     if len(hits) > 1:
-        awbs = [lark.flat_text((h.get("fields") or {}).get(F31["awb"])) for h in hits]
-        row["match_error"] = f"3.1 匹配到 {len(hits)} 行（{' / '.join(awbs)}）— 请人工处理"
-        return row
+        # Split shipment: several rows share this 柜号+路线. Tell them apart
+        # by the line's 箱数 (then 预计板数) — see _disambiguate_31.
+        matched, how = _disambiguate_31(hits, p["pallets"], p["boxes"])
+        if matched is None:
+            cand = "；".join(
+                f"箱数{_n(lark.num_of((h['fields'] or {}).get(F31['boxes'])) or 0)}"
+                f"/实际板数「{lark.flat_text((h['fields'] or {}).get(F31['actual'])) or '空'}」"
+                for h in hits)
+            row["match_error"] = (f"3.1 匹配到 {len(hits)} 行且无法按箱数/板数区分"
+                                  f"（提供 {p['pallets']}板/{p['boxes']}箱；"
+                                  f"表内候选：{cand}）— 请人工处理")
+            return row
+        N(f"同柜号+路线共 {len(hits)} 行 — 已按{how}精确匹配到其中一行")
+        hits = [matched]
 
     rec = hits[0]
     f = rec.get("fields") or {}
@@ -609,7 +712,7 @@ def _plan_row(ctx, p):
         # the whole appointment/trip step is disabled (pallet checks above
         # still ran). Duplicate the 5.x table + extend config.js to enable.
         row["plan"] = {"status": "no_dev_plan_table"}
-        N(f"DEV 环境无「{wh['plan_table']}」副本表 — 预约/行程操作已停用（仅板数核对）")
+        N(f"DEV 环境无「{wh['plan_table']}」副本表 — 预约/出库计划操作已停用（仅板数核对）")
         return row
 
     plan_table = wh["plan_table"]
@@ -645,10 +748,10 @@ def _plan_row(ctx, p):
         if rid not in trip_inv_ids:
             # 3.1->5.x and 5.x->3.1 are the SAME duplex link, so this should
             # be impossible; surface it rather than "fixing" silently.
-            W("数据异常：3.1 行挂了行程，但行程的库存关联里没有这一行")
+            W("数据异常：3.1 行挂了出库计划，但该出库计划的库存关联里没有这一行")
             total += provided
         if total > TRIP_PALLET_CAP:
-            W(f"W3 行程总板数 {_n(total)} 超过 {TRIP_PALLET_CAP} 板上限")
+            W(f"W3 出库计划总板数 {_n(total)} 超过 {TRIP_PALLET_CAP} 板上限")
 
         if not isa_ids:
             # Edge: a trip exists but has no appointment linked.
@@ -663,11 +766,9 @@ def _plan_row(ctx, p):
                                            "isa_record_id": ex["rec_id"]})
                     _check_time_update(row, ctx, ex, p, W)
                 else:
-                    _plan_create_isa(row, ctx, p, W)
-                    row["actions"].append({"type": "set_trip_isa", "trip_id": trip_id,
-                                           "isa_record_id": "@group"})
+                    _block_missing_isa(row, p)   # keeps has_plan_no_isa context
             else:
-                N("行程未关联预约（未提供 ISA，无法核对）")
+                N("出库计划未关联预约（未提供 ISA，无法核对）")
             return row
 
         isa_rec_id = isa_ids[0]
@@ -691,16 +792,30 @@ def _plan_row(ctx, p):
             row["plan"]["status"] = "has_plan_match"
             N("派送计划的 ISA+时间与提供值一致 — 无需改动")
         else:
-            # 4A mismatch: EDIT THE LINKED 5.6 RECORD to the session values.
+            # 4A mismatch: EDIT THE LINKED 5.6 RECORD to the session values
+            # (runbook 4A — a rescheduled appointment keeps its record).
             # ⚠ This updates the appointment itself, so it propagates to every
-            #   other shipment on the same trip — that is the intended
-            #   behaviour for a rescheduled appointment (per runbook 4A).
+            #   other shipment on the same 出库计划.
             row["plan"]["status"] = "has_plan_mismatch"
+            # GUARD — ISA uniqueness. If the pasted ISA already exists as a
+            # DIFFERENT 5.6 record, rewriting this record's ISA to it would
+            # put the same ISA on two records. Refuse; re-pointing a shipment
+            # to another appointment is a link change, not an ISA edit.
+            if not same_isa:
+                other = _resolve_isa(ctx, p["isa"])
+                if other and other["rec_id"] != isa_rec_id:
+                    row["blockers"].append(
+                        f"ISA {p['isa']} 已存在于另一条预约记录（{other['rec_id']}）— "
+                        f"不能把当前预约（ISA {_n(cur_isa)}）改成它，否则 5.6 会出现"
+                        f"重复 ISA。请先在飞书里把该货件从当前出库计划移出，"
+                        f"再挂到目标预约的出库计划")
+                    return row
             row["actions"].append({"type": "update_isa_time",
                                    "isa_record_id": isa_rec_id,
                                    "isa": p["isa"], "time": p["time"]})
             W(f"派送计划不一致（现 ISA={_n(cur_isa)} 时间={cur_time or '空'} → "
-              f"新 ISA={p['isa']} 时间={p['time']}）— 更新将影响该行程下所有货件")
+              f"新 ISA={p['isa']} 时间={p['time']}）— 更新将影响该出库计划下所有货件"
+              + ("；ISA 号将被改写" if not same_isa else ""))
         return row
 
     # ---- 4B: no plan on the row ------------------------------------------
@@ -727,7 +842,7 @@ def _plan_row(ctx, p):
             trip_inv_ids = lark.link_ids(trip.get(inv_field))
             if rid in trip_inv_ids:
                 row["plan"] = {"status": "already_on_trip", "trip_id": trip_id}
-                N("该行程已包含本货件 — 无需改动")
+                N("该出库计划已包含本货件 — 无需改动")
             else:
                 # Cap check counts the whole ISA group: every group line joins
                 # this same trip in this batch (single-line groups sum to just
@@ -740,7 +855,7 @@ def _plan_row(ctx, p):
                                        "plan_link_field": plan_link_field,
                                        "trip_id": trip_id})
                 if total > TRIP_PALLET_CAP:
-                    W(f"W3 挂靠后行程总板数约 {_n(total)} 超过 {TRIP_PALLET_CAP} 板上限")
+                    W(f"W3 挂靠后出库计划总板数约 {_n(total)} 超过 {TRIP_PALLET_CAP} 板上限")
             _check_time_update(row, ctx, ex, p, W)
         else:
             # -- 4B(ii): ISA exists, no trip -> ONE new trip for the group
@@ -752,34 +867,23 @@ def _plan_row(ctx, p):
             _check_time_update(row, ctx, ex, p, W)
             _warn_group_cap(ctx, p, W)
     else:
-        # -- 4B(iii): ISA not in 5.6 -> create appointment + trip + link ----
-        _plan_create_isa(row, ctx, p, W)
-        if not row["blockers"]:
-            row["plan"] = {"status": "create_isa_and_trip"}
-            row["actions"].append({"type": "create_trip", "group_isa": p["isa"]})
-            row["actions"].append({"type": "link_trip", "record_id": rid,
-                                   "plan_link_field": plan_link_field,
-                                   "trip_id": "@group"})
-            _warn_group_cap(ctx, p, W)
+        # -- 4B(iii): ISA not in 5.6 -> BLOCK. This step never creates
+        # appointments; that is exclusively「①新建预约」's job (single writer
+        # per table — see the module docstring).
+        _block_missing_isa(row, p)
     return row
 
 
-def _plan_create_isa(row, ctx, p, W):
-    """Queue the ISA-group's 5.6 create (validated against LIVE select
-    options — a route like YEG3 that is not a 5.6 目的地 option BLOCKS the
-    row rather than inventing an option)."""
-    wh = ctx["wh"]
-    if p["dest"] not in ctx["valid_dests"]:
-        row["blockers"].append(
-            f"目的地「{p['dest']}」不是 5.6 的现有选项 — 无法创建预约（绝不自动新增选项）")
-        return
-    if wh["account"] not in ctx["valid_accounts"]:
-        row["blockers"].append(f"预约账号「{wh['account']}」不是 5.6 的现有选项")
-        return
-    row["actions"].append({"type": "create_isa", "group_isa": p["isa"],
-                           "fields": {F56["isa"]: p["isa"], F56["dest"]: p["dest"],
-                                      F56["account"]: wh["account"],
-                                      F56["time"]: p["time"]}})
+def _block_missing_isa(row, p):
+    """This module NEVER creates 5.6 records. A line whose ISA does not exist
+    yet is refused with a pointer to the tab that does create them, so the
+    operator's step order stays ① create -> ② sync.
+    Keeps any plan context the caller already recorded (e.g. the trip id in
+    the has_plan_no_isa branch)."""
+    row["blockers"].append(
+        f"5.6 中没有 ISA {p['isa']} — 请先在「①新建预约」创建该预约，再回到本页同步计划")
+    if not row["plan"]:
+        row["plan"] = {"status": "isa_missing"}
 
 
 def _check_time_update(row, ctx, ex, p, W):
@@ -798,7 +902,7 @@ def _warn_group_cap(ctx, p, W):
     """W3 for a NEW trip: it starts with exactly the ISA group's shipments."""
     grp = ctx["groups"].get(p.get("isa"))
     if grp and grp.get("pallet_sum", 0) > TRIP_PALLET_CAP:
-        W(f"W3 新行程总板数 {_n(grp['pallet_sum'])} 超过 {TRIP_PALLET_CAP} 板上限")
+        W(f"W3 新出库计划总板数 {_n(grp['pallet_sum'])} 超过 {TRIP_PALLET_CAP} 板上限")
 
 
 def _n(x):
@@ -833,16 +937,16 @@ def commit(warehouse, text, approvals, client_env, progress=None):
     PHASES (order matters — later phases need record ids from earlier ones):
       0. re-plan everything from fresh reads; a row whose action signature no
          longer equals the approved `sig` is SKIPPED ("情况已变化").
-      1. batch_create 5.6      — one appointment per approved ISA group
-      2. batch_create 5.x      — one trip per approved ISA group, created WITH
-                                 its 预约信息 duplex link already set (the 5.6
-                                 back-link fills itself)
-      2b. batch_update 5.x     — set_trip_isa edge rows (trip existed w/o ISA)
+      1. batch_create 5.x      — one 出库计划 per approved ISA group, created
+                                 WITH its 预约信息 duplex link pointing at the
+                                 EXISTING 5.6 record (back-link fills itself)
+      2. batch_update 5.x      — set_trip_isa edge rows (出库计划 w/o 预约)
       3. batch_update 3.1      — per row: 实际板数 fill + plan link, ONE update
                                  per record (link写在 3.1 侧 => 5.x 库存信息
                                  back-link fills itself, both environments)
       4. batch_update 5.6      — 4A mismatch ISA/time edits (deduped by record;
-                                 conflicting values refuse BOTH sides)
+                                 conflicting values refuse BOTH sides).
+                                 UPDATES ONLY — this flow never creates 5.6.
       5. read-back verification — re-read what we wrote and annotate each row
                                  verified=True/False. Nothing is trusted blind.
     Every phase failure is captured per-row; a failed prerequisite stops the
@@ -912,45 +1016,23 @@ def _commit_locked(warehouse, text, approvals, tick):
         return lark._api("POST", path, payload=payload,
                          query={"client_token": _ctoken(op, lark.env(), *token_parts)})
 
-    # ---- Phase 1: one 5.6 create per ISA group ----------------------------
-    # Collect create_isa actions; several lines can carry the same group's
-    # create — materialize each group exactly once.
-    tick(stage="写入 1/5 · 新建预约（5.6）", done=0, total=0, current="")
-    group_isa_rec = {}     # isa -> record_id (newly created)
-    create_jobs = {}       # isa -> (fields, [rows])
-    for r in rows:
-        for a in r["actions"]:
-            if a["type"] == "create_isa":
-                create_jobs.setdefault(a["group_isa"], (a["fields"], []))[1].append(r)
-    if create_jobs:
-        isas = sorted(create_jobs)
-        payload = {"records": [{"fields": create_jobs[i][0]} for i in isas]}
-        try:
-            made = api_write("c56", f"/open-apis/bitable/v1/apps/{base}/tables/{t56}"
-                             "/records/batch_create", payload,
-                             [t56, ",".join(map(str, isas))]).get("records", [])
-            for isa, rec in zip(isas, made):
-                group_isa_rec[isa] = rec.get("record_id")
-                for r in create_jobs[isa][1]:
-                    r.setdefault("commit", {})["isa_record_id"] = rec.get("record_id")
-        except Exception as e:
-            for _, rs in create_jobs.values():
-                for r in rs:
-                    r.setdefault("commit", {})["error"] = f"5.6 创建失败：{e}"
+    # NOTE: there is deliberately NO 5.6-create phase here. Appointments are
+    # created exclusively by appointment_create.py（①新建预约）; a line whose
+    # ISA is missing was blocked at plan time. This module only WIRES and
+    # UPDATES existing appointments.
 
-    # ---- Phase 2: one trip create per ISA group ---------------------------
-    tick(stage="写入 2/5 · 新建出库计划行程（5.x）")
+    # ---- Phase 1: one 出库计划 record per ISA group -----------------------
+    tick(stage="写入 1/4 · 新建出库计划（5.x）", done=0, total=0, current="")
     group_trip_rec = {}    # isa -> trip record_id
     trip_jobs = {}         # isa -> (isa_record_id, [rows])
     for r in rows:
         if (r.get("commit") or {}).get("error"):
-            continue       # its 5.6 create failed — do not build on top of it
+            continue
         for a in r["actions"]:
             if a["type"] != "create_trip":
                 continue
             isa = a["group_isa"]
-            isa_rec = (r["plan"].get("isa_record_id")     # 4B(ii): existing 5.6
-                       or group_isa_rec.get(isa))         # 4B(iii): just created
+            isa_rec = r["plan"].get("isa_record_id")   # always an EXISTING 5.6 row
             if not isa_rec:
                 r.setdefault("commit", {})["error"] = "预约记录缺失，无法创建出库计划"
                 continue
@@ -971,8 +1053,8 @@ def _commit_locked(warehouse, text, approvals, tick):
                 for r in rs:
                     r.setdefault("commit", {})["error"] = f"出库计划创建失败：{e}"
 
-    # ---- Phase 2b: attach an ISA to a pre-existing, ISA-less trip ---------
-    tick(stage="写入 2b/5 · 行程补挂预约")
+    # ---- Phase 2: attach an ISA to a pre-existing, appointment-less 出库计划 --
+    tick(stage="写入 2/4 · 出库计划补挂预约")
     set_jobs = []
     for r in rows:
         if (r.get("commit") or {}).get("error"):
@@ -980,11 +1062,9 @@ def _commit_locked(warehouse, text, approvals, tick):
         for a in r["actions"]:
             if a["type"] != "set_trip_isa":
                 continue
-            isa_rec = a["isa_record_id"]
-            if isa_rec == "@group":
-                isa_rec = group_isa_rec.get(r["parsed"]["isa"])
+            isa_rec = a["isa_record_id"]        # always concrete (existing 5.6)
             if not isa_rec:
-                r.setdefault("commit", {})["error"] = "预约记录缺失，无法挂到行程"
+                r.setdefault("commit", {})["error"] = "预约记录缺失，无法挂到出库计划"
                 continue
             set_jobs.append((r, {"record_id": a["trip_id"],
                                  "fields": {isa_field: [isa_rec]}}))
@@ -998,10 +1078,10 @@ def _commit_locked(warehouse, text, approvals, tick):
                 r.setdefault("commit", {})["trip_isa_set"] = True
         except Exception as e:
             for r, _ in set_jobs:
-                r.setdefault("commit", {})["error"] = f"行程挂预约失败：{e}"
+                r.setdefault("commit", {})["error"] = f"出库计划挂预约失败：{e}"
 
     # ---- Phase 3: 3.1 updates (实际板数 fill + plan link, merged) ----------
-    tick(stage="写入 3/5 · 更新 3.1（实际板数 + 关联行程）")
+    tick(stage="写入 3/4 · 更新 3.1（实际板数 + 关联出库计划）")
     upd31 = {}             # record_id -> (fields, row)
     for r in rows:
         if (r.get("commit") or {}).get("error"):
@@ -1015,7 +1095,7 @@ def _commit_locked(warehouse, text, approvals, tick):
                 if trip_id == "@group":
                     trip_id = group_trip_rec.get(r["parsed"]["isa"])
                 if not trip_id:
-                    r.setdefault("commit", {})["error"] = "行程记录缺失，无法关联 3.1"
+                    r.setdefault("commit", {})["error"] = "出库计划记录缺失，无法关联 3.1"
                     fields = None
                     break
                 # The row reached here via the no-plan branch, so the link
@@ -1035,8 +1115,8 @@ def _commit_locked(warehouse, text, approvals, tick):
             for _, r in upd31.values():
                 r.setdefault("commit", {})["error"] = f"3.1 更新失败：{e}"
 
-    # ---- Phase 4: 4A mismatch — edit the LINKED 5.6 record ----------------
-    tick(stage="写入 4/5 · 更新预约 ISA/时间（5.6）")
+    # ---- Phase 4: 4A mismatch — UPDATE (never create) the linked 5.6 row ---
+    tick(stage="写入 4/4 · 更新预约 ISA/时间（5.6）")
     upd56 = {}             # isa_record_id -> (fields, [rows])
     for r in rows:
         if (r.get("commit") or {}).get("error"):
@@ -1044,7 +1124,8 @@ def _commit_locked(warehouse, text, approvals, tick):
         for a in r["actions"]:
             if a["type"] != "update_isa_time":
                 continue
-            fields = {F56["isa"]: a["isa"], F56["time"]: a["time"]}
+            # a["time"] is canonical; 复制时间列 STORES month-first
+            fields = {F56["isa"]: a["isa"], F56["time"]: store_time(a["time"])}
             prev = upd56.get(a["isa_record_id"])
             if prev and prev[0] != fields:
                 # Two rows demand different values for ONE appointment —
@@ -1072,7 +1153,7 @@ def _commit_locked(warehouse, text, approvals, tick):
                     r.setdefault("commit", {})["error"] = f"5.6 更新失败：{e}"
 
     # ---- Phase 5: read-back verification ----------------------------------
-    tick(stage="核实 5/5 · 回读校验写入结果")
+    tick(stage="核实 · 回读校验写入结果")
     _verify(rows, t31, t56, group_trip_rec)
     tick(stage="完成", current="")
 
@@ -1106,8 +1187,6 @@ def _verify(rows, t31, t56, group_trip_rec):
             for a in r["actions"]:
                 if a["type"] == "update_isa_time":
                     rids56.add(a["isa_record_id"])
-        if c.get("isa_record_id"):
-            rids56.add(c["isa_record_id"])
     fields56 = _batch_get(t56, list(rids56), [F56["isa"], F56["time"]]) if rids56 else {}
 
     for r in rows:
@@ -1133,17 +1212,11 @@ def _verify(rows, t31, t56, group_trip_rec):
                 ok = got_isa is not None and int(got_isa) == a["isa"] \
                     and got_time == a["time"]
                 checks.append(("预约ISA/时间", ok, f"{_n(got_isa)} {got_time or '空'}"))
-            elif a["type"] == "create_isa":
-                rec_id = c.get("isa_record_id")
-                f56 = fields56.get(rec_id, {}) if rec_id else {}
-                got_isa = lark.num_of(f56.get(F56["isa"]))
-                checks.append(("新建预约", got_isa is not None
-                               and int(got_isa) == a["group_isa"], _n(got_isa)))
             elif a["type"] == "create_trip":
-                checks.append(("新建行程", bool(c.get("trip_record_id")),
+                checks.append(("新建出库计划", bool(c.get("trip_record_id")),
                                c.get("trip_record_id") or "无"))
             elif a["type"] == "set_trip_isa":
-                checks.append(("行程挂预约", bool(c.get("trip_isa_set")), ""))
+                checks.append(("出库计划挂预约", bool(c.get("trip_isa_set")), ""))
         c["done"] = True
         c["verified"] = all(ok for _, ok, _ in checks) if checks else True
         c["checks"] = [{"what": w, "ok": ok, "got": g} for w, ok, g in checks]

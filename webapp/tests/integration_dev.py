@@ -143,11 +143,23 @@ def cleanup():
     n_t = delete_records(DEV52, trips)
     n_a = delete_records(DEV56, recs56)
     n_r = delete_records(DEV31, rows31)
+
+    # Reset the ONE real row this suite writes (REAL_EMPTY): its original
+    # state is 实际板数 empty + no plan link — restore it so the fill/link
+    # scenarios are repeatable. REAL_OCCUPIED is never written, never touched.
+    import appointment_sync as _s
+    plan_link = _s._env_wiring("5.2 BESTAR-CAL")["plan_link_31"]
+    real = search(DEV31, "柜号/AWB", "is", REAL_EMPTY)
+    if real:
+        api("POST", f"/open-apis/bitable/v1/apps/{base()}/tables/{DEV31}"
+            "/records/batch_update",
+            payload={"records": [{"record_id": real[0]["record_id"],
+                                  "fields": {"实际板数": "", plan_link: []}}]})
     for k in CREATED:
         CREATED[k] = []
     save_state()
     print(f"[cleanup] tracked+marked only: trips={n_t}  5.6={n_a}  3.1={n_r}"
-          f"（真实数据不受影响）")
+          f"（真实行 {REAL_EMPTY} 已复位为空板数；其余真实数据不受影响）")
 
 
 def seed():
@@ -162,14 +174,23 @@ def seed():
                payload={"records": recs}).get("records", [])
     for r in made:
         track("rows31", r.get("record_id"))
+    # Appointments are pre-seeded — since the de-overlap (2026-08-04) ②计划同步
+    # NEVER creates 5.6 records; these stand in for what ①新建预约 produces.
     made56 = api("POST", f"/open-apis/bitable/v1/apps/{base()}/tables/{DEV56}/records/batch_create",
-                 payload={"records": [{"fields": {"ISA": ISA_EXISTING, "目的地": "YYC1",
-                                                  "预约账号": "BESTAR",
-                                                  "复制时间列": "2026/08/01 09:00",
-                                                  "SourceID": MARK}}]}).get("records", [])
+                 payload={"records": [
+                     {"fields": {"ISA": ISA_EXISTING, "目的地": "YYC1",
+                                 "预约账号": "BESTAR",
+                                 "复制时间列": "08/01/2026 09:00", "SourceID": MARK}},
+                     {"fields": {"ISA": ISA_GROUP, "目的地": "YYC4",
+                                 "预约账号": "BESTAR",
+                                 "复制时间列": "08/02/2026 10:00", "SourceID": MARK}},
+                     {"fields": {"ISA": ISA_REAL, "目的地": "YVR4",
+                                 "预约账号": "BESTAR",
+                                 "复制时间列": "08/04/2026 09:00", "SourceID": MARK}},
+                 ]}).get("records", [])
     for r in made56:
         track("recs56", r.get("record_id"))
-    print(f"[seed] {len(recs)} dev-3.1 rows + dev-5.6 ISA {ISA_EXISTING} (BESTAR, 无行程)")
+    print(f"[seed] {len(recs)} dev-3.1 rows + 3 dev-5.6 预约（模拟①的产物, 均无出库计划）")
 
 
 def approve_all(planned):
@@ -270,13 +291,16 @@ def phase_perf_progress():
 
 
 def phase_group_create():
-    print("\n== 2 · 4B(iii): unknown ISA -> ONE 5.6 + ONE trip for the group ==")
+    print("\n== 2 · 4B(ii) group: seeded ISA -> ONE 出库计划 for both lines ==")
     text = (f"TESTU0000055 YYC4 4 80 {ISA_GROUP} 08/02/2026 10:00 PDT\n"
             f"TESTU0000066 YYC4 1 70 {ISA_GROUP} 08/02/2026 10:00 PDT")
     planned = sync.plan("BESTAR", text)
     for r in planned["rows"]:
-        check(f"line {r['line_no']} plans create_isa_and_trip",
-              r["plan"]["status"] == "create_isa_and_trip", r["plan"].get("status"))
+        check(f"line {r['line_no']} plans create_trip (reusing seeded 预约)",
+              r["plan"]["status"] == "create_trip"
+              and r["plan"].get("isa_record_id"), r["plan"].get("status"))
+        check(f"line {r['line_no']} has NO create_isa action",
+              "create_isa" not in [a["type"] for a in r["actions"]])
 
     stages, slock = [], threading.Lock()
 
@@ -294,19 +318,21 @@ def phase_group_create():
         check(f"line {r['line_no']} verified", r["commit"].get("verified") is True,
               str(r["commit"]))
     trip_ids = {r["commit"].get("trip_record_id") for r in rows}
-    isa_recs = {r["commit"].get("isa_record_id") for r in rows}
     check("group produced exactly ONE trip", len(trip_ids) == 1, str(trip_ids))
-    check("group produced exactly ONE 5.6 record", len(isa_recs) == 1, str(isa_recs))
+    isa_recs = {r["plan"].get("isa_record_id") for r in planned["rows"]}
+    check("both lines reused ONE seeded 5.6 record", len(isa_recs) == 1, str(isa_recs))
+    check("no 5.6 record was created by ②",
+          not any((r.get("commit") or {}).get("isa_record_id") for r in rows))
 
     joined = " | ".join(stages)
     check("commit streamed stage progress",
-          "复检" in joined and "写入 1/5" in joined and "核实 5/5" in joined
+          "复检" in joined and "写入 1/4" in joined and "核实" in joined
           and stages[-1] == "完成", joined[:200])
 
     trip_id, isa_rec = trip_ids.pop(), isa_recs.pop()
     st = trip_state(trip_id)
     check("trip links BOTH dev-3.1 rows", st and len(st["inv"]) == 2, str(st))
-    check("trip links the new dev-5.6 record", st and st["isa"] == [isa_rec], str(st))
+    check("trip links the seeded dev-5.6 record", st and st["isa"] == [isa_rec], str(st))
 
     row = sync.plan("BESTAR", text)["rows"][0]
     check("replan shows has_plan_match", row["plan"]["status"] == "has_plan_match",
@@ -369,13 +395,13 @@ def phase_w3_join(group_trip):
 
 
 def phase_real_full_chain():
-    print("\n== 6 · REAL row full chain: fill + create ISA + trip + link ==")
+    print("\n== 6 · REAL row: fill + 出库计划 + link（预约已由①预先存在） ==")
     text = f"{REAL_EMPTY} YVR4 11 203 {ISA_REAL} 08/04/2026 09:00 PDT"
     planned = sync.plan("BESTAR", text)
     row = planned["rows"][0]
     types = [a["type"] for a in row["actions"]]
-    check("real row plans fill + create_isa + trip + link",
-          types == ["fill_pallets", "create_isa", "create_trip", "link_trip"],
+    check("real row plans fill + create_trip + link (NO create_isa)",
+          types == ["fill_pallets", "create_trip", "link_trip"],
           str(types))
     res = commit_tracked("BESTAR", text)
     c = (res["rows"][0].get("commit") or {})

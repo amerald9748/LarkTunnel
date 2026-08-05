@@ -93,23 +93,22 @@ class CommitCase(unittest.TestCase):
 
 
 class TestCommitPhases(CommitCase):
-    def test_group_creates_once_links_twice(self):
+    def test_group_creates_one_trip_links_twice(self):
+        """②计划同步 on a group whose appointment already exists (made by ①):
+        ONE 出库计划 create, both shipments linked, NO 5.6 create at all."""
         self.fx.rows31 = [make_31("a"), make_31("b", awb="TCNU4251020B", dest="YVR2")]
+        self.fx.rows56 = [make_56(isa=9903350996)]        # created earlier by ①
         planned = sync.plan("VAST", LINE_A + "\n" + LINE_B)
         res = sync.commit("VAST", LINE_A + "\n" + LINE_B,
                           self.approve_all(planned), "prod")
 
         kinds = [(k, t) for k, t, _, _ in self.fx.calls]
-        # exactly ONE 5.6 create, ONE trip create, ONE 3.1 update batch
-        self.assertEqual(kinds.count(("create", T56)), 1)
+        # NEVER a 5.6 create from this flow — that is ①'s exclusive job
+        self.assertEqual(kinds.count(("create", T56)), 0)
         self.assertEqual(kinds.count(("create", T54)), 1)
         self.assertEqual(kinds.count(("update", T31)), 1)
-        # phase order: 5.6 -> 5.x -> 3.1
-        self.assertEqual(kinds, [("create", T56), ("create", T54), ("update", T31)])
-
-        c56 = next(p for k, t, p, _ in self.fx.calls if (k, t) == ("create", T56))
-        self.assertEqual(len(c56["records"]), 1)          # ISA group deduped
-        self.assertEqual(c56["records"][0]["fields"]["ISA"], 9903350996)
+        # phase order: 5.x 出库计划 -> 3.1
+        self.assertEqual(kinds, [("create", T54), ("update", T31)])
 
         u31 = next(p for k, t, p, _ in self.fx.calls if (k, t) == ("update", T31))
         self.assertEqual(len(u31["records"]), 2)          # both shipments linked
@@ -140,7 +139,8 @@ class TestCommitPhases(CommitCase):
         u56 = self.fx.calls[0][2]["records"][0]
         self.assertEqual(u56["record_id"], "r56a")        # the LINKED record
         self.assertEqual(u56["fields"]["ISA"], 9903350996)
-        self.assertEqual(u56["fields"]["复制时间列"], "2026/07/30 13:00")
+        # STORAGE format is month-first (operator-specified 2026-08-04)
+        self.assertEqual(u56["fields"]["复制时间列"], "07/30/2026 13:00")
         row = next(r for r in res["rows"] if r.get("approved"))
         self.assertTrue(row["commit"]["verified"])
 
@@ -156,6 +156,7 @@ class TestCommitPhases(CommitCase):
 
     def test_sig_mismatch_skips_and_writes_nothing(self):
         self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56(isa=9903350996)]        # appointment exists
         planned = sync.plan("VAST", LINE_A)
         approvals = self.approve_all(planned)
         # the Base changes between review and click:
@@ -171,12 +172,13 @@ class TestCommitPhases(CommitCase):
 
     def test_recommit_converges_instead_of_duplicating(self):
         # Operator-level retry safety: a re-click after a successful commit
-        # re-plans, finds the created ISA/trip, and plans NO further creates.
+        # re-plans, finds the created 出库计划, and plans NO further creates.
         self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56(isa=9903350996)]        # appointment exists
         planned = sync.plan("VAST", LINE_A)
         sync.commit("VAST", LINE_A, self.approve_all(planned), "prod")
         first_creates = sum(1 for k, _, _, _ in self.fx.calls if k == "create")
-        self.assertEqual(first_creates, 2)                # one 5.6 + one trip
+        self.assertEqual(first_creates, 1)                # one 出库计划 only
         replanned = sync.plan("VAST", LINE_A)
         row = replanned["rows"][0]
         self.assertEqual(row["plan"]["status"], "has_plan_match")

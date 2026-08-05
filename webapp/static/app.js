@@ -15,7 +15,7 @@ const el = (tag, attrs = {}, ...kids) => {
 };
 
 const state = { tables: [], views: [], fieldKey: "awb", mode: "contains", tz: "",
-  parse: null, commitWarehouse: null, lastPlan: null };
+  parse: null };
 
 // ---- console reporting ------------------------------------------------------
 // 任务状态/结果/报错统一实时打进浏览器 console（F12 打开跟踪）。
@@ -53,6 +53,36 @@ function statusChipClass(v) {
   return "neu";
 }
 
+// ---- theme (自动 / 浅色 / 深色) --------------------------------------------
+// The <head> script already stamped data-theme for the first paint; this only
+// handles cycling + persistence + reacting to OS changes while in 自动.
+const THEME_KEY = "larkTheme";
+const THEME_MODES = [["auto", "🌗 自动"], ["light", "☀️ 浅色"], ["dark", "🌙 深色"]];
+
+function applyTheme(mode) {
+  const dark = mode === "dark" || (mode === "auto"
+    && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  const label = (THEME_MODES.find((t) => t[0] === mode) || THEME_MODES[0])[1];
+  const btn = $("#themeBtn");
+  if (btn) btn.textContent = label;
+}
+
+function initTheme() {
+  let mode = "auto";
+  try { mode = localStorage.getItem(THEME_KEY) || "auto"; } catch (e) { /* private mode */ }
+  applyTheme(mode);
+  $("#themeBtn").addEventListener("click", () => {
+    const i = THEME_MODES.findIndex((t) => t[0] === mode);
+    mode = THEME_MODES[(i + 1) % THEME_MODES.length][0];
+    try { localStorage.setItem(THEME_KEY, mode); } catch (e) { /* ignore */ }
+    applyTheme(mode);
+    clog("主题", mode);
+  });
+  window.matchMedia("(prefers-color-scheme: dark)")
+    .addEventListener("change", () => { if (mode === "auto") applyTheme("auto"); });
+}
+
 // ---- tabs -------------------------------------------------------------------
 function initTabs() {
   $("#tabs").addEventListener("click", (e) => {
@@ -69,6 +99,7 @@ function switchTab(name) {
 
 // ---- bootstrap ------------------------------------------------------------
 async function boot() {
+  initTheme();
   initTabs();
   bootSync();
   try {
@@ -235,9 +266,7 @@ const FIELD_ORDER = ["awb", "batch", "warehouse", "route", "appointment", "isa"]
 
 function renderParsed(r) {
   const out = $("#parseOut");
-  state.parse = r;                 // keep for dry-run / commit
-  state.commitWarehouse = null;    // new file -> stale dry-run pins are void
-  state.lastPlan = null;
+  state.parse = r;                 // kept for the hand-off buttons
   out.innerHTML = "";
   const sheetTxt = (r.sheets || []).map((s) => `${s.name}(${s.rows}行)`).join("、");
   out.append(el("div", { class: "filemeta" },
@@ -284,7 +313,6 @@ function renderParsed(r) {
   out.append(row);
 
   renderDetails(out, r.details || []);
-  updateUploadGate();   // no 仓库供应商 chosen yet -> upload/dry-run stay disabled
 }
 
 // Per-container table: each 柜号 with its own 预约号/预约时间, including
@@ -296,16 +324,33 @@ function renderDetails(out, details) {
     `📦 柜号明细 · ${details.length} 条` +
     (groups.size ? `（其中 ${groups.size} 个预约号为多柜分组）` : "")));
 
-  // ---- 5.6 upload controls (dry-run first) ----
+  // ---- hand-off to ①/② (this tab performs NO writes of its own) ----
+  // The old 预演/上传到 5.6 buttons lived here and were a THIRD writer of
+  // 5.6 + 出库计划, overlapping ①/②. Removed on purpose: parsing feeds the
+  // dedicated tabs, which own their tables.
   const controls = el("div", { class: "up56" });
-  const dryBtn = el("button", { class: "primary", id: "dry56Btn" }, "预演上传到 5.6（dry-run）");
-  dryBtn.addEventListener("click", () => dryRun56(dryBtn));
-  controls.append(dryBtn, el("span", { class: "up56note" },
-    "按 ISA 去重 · 校验目的地/预约账号 · 预约账号＝上方所选「仓库供应商」"),
-    el("span", { class: "up56gate", id: "whGateNote", hidden: "" },
-      "⚠ 请先选择仓库供应商，再进行上传/预演"));
+  const toCreate = el("button", { class: "primary" }, "→ 送到「① 新建预约」");
+  toCreate.addEventListener("click", () => {
+    const lines = details.filter((d) => d.isa && d.route && d.appointment)
+      .map((d) => `${d.route}\t${d.isa}\t${d.appointment}`);
+    if (!lines.length) { alert("没有可用行：需要同时有 目的地路线 + ISA + 预约时间"); return; }
+    clog("解析", `送出 ${lines.length} 行到 ①新建预约`);
+    sendToTab("create", lines);
+  });
+  const toSync = el("button", { class: "primary" }, "→ 送到「② 计划同步」");
+  toSync.addEventListener("click", () => {
+    const lines = details.filter((d) => d.awb && d.route).map((d) => {
+      const pal = d.pallets != null ? d.pallets : "";
+      const tail = d.isa && d.appointment ? `\t${d.isa}\t${d.appointment}` : "";
+      return `${d.awb}\t${d.route}\t${pal}\t\t${tail}`.replace(/\t+$/, "");
+    });
+    if (!lines.length) { alert("没有可用行：需要 柜号 + 目的地路线"); return; }
+    clog("解析", `送出 ${lines.length} 行到 ②计划同步（请补齐板数/箱数）`);
+    sendToTab("sync", lines);
+  });
+  controls.append(toCreate, toSync, el("span", { class: "up56note" },
+    "本页不写入任何表；② 需要的「实际板数 / 箱数」请在那边补齐后再预检"));
   out.append(controls);
-  out.append(el("div", { id: "manifest56", class: "manifest" }));
 
   const cols = ["柜号", "目的地路线", "预约号 / ISA", "预约时间", "板数", "操作"];
   const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c))));
@@ -313,9 +358,6 @@ function renderDetails(out, details) {
   for (const d of details) {
     const qBtn = el("button", { class: "mini" }, "查询");
     qBtn.addEventListener("click", () => useParsed("awb", d.awb));
-    const upBtn = el("button", { class: "mini up" }, "上传");
-    const upStat = el("span", { class: "upstat" });
-    upBtn.addEventListener("click", () => uploadRecord(d, upBtn, upStat));
     const tr = el("tr", {},
       el("td", {}, el("b", {}, d.awb)),
       el("td", {}, d.route || nullSpan()),
@@ -323,311 +365,19 @@ function renderDetails(out, details) {
         String(d.isa), d.grouped ? el("span", { class: "gtag" }, "分组") : null) : nullSpan()),
       el("td", {}, d.appointment || nullSpan()),
       el("td", {}, palletText(d)),
-      el("td", {}, el("div", { class: "ops" }, qBtn, upBtn, upStat)));
+      el("td", {}, el("div", { class: "ops" }, qBtn)));
     tbody.append(tr);
   }
   out.append(el("div", { class: "dethint" },
-    "⬆ 上传目标：飞书「5.6 预约表」（真实写入）· 按 ISA 去重、校验目的地/预约账号 · 建议先「预演」"));
+    "本页只解析；写入请用上方按钮送到「① 新建预约」/「② 计划同步」执行"));
   out.append(el("div", { class: "tablewrap dettable" }, el("table", {}, thead, tbody)));
 }
 
-function whValue() {
-  const s = document.querySelector(".whsel");
-  return s ? s.value : "";
-}
-
-// Gate all upload actions on a chosen 仓库供应商: the per-row 上传 buttons and
-// the 预演 button stay disabled until the dropdown has a value (locked
-// file-derived values count). Buttons that are done or mid-flight are skipped.
-function updateUploadGate() {
-  const ok = !!whValue();
-  const tip = ok ? "" : "请先选择仓库供应商";
-  const dry = $("#dry56Btn");
-  if (dry) { dry.disabled = !ok; dry.title = tip; }
-  document.querySelectorAll("button.mini.up").forEach((b) => {
-    if (b.dataset.done === "1" || b.dataset.busy === "1") return;
-    b.disabled = !ok;
-    b.title = tip;
-  });
-  const note = $("#whGateNote");
-  if (note) note.hidden = ok;
-  if (!ok) clog("上传", "已禁用：请先选择仓库供应商");
-}
-
-// Upload ONE record to 5.6 (guarded). Shows created / skip-exists / block.
-async function uploadRecord(d, btn, stat) {
-  if (btn.dataset.done === "1") return;
-  if (!whValue()) { updateUploadGate(); return; }  // gate: need a 仓库供应商
-  btn.disabled = true;
-  btn.dataset.busy = "1";
-  const prev = btn.textContent;
-  btn.textContent = "上传中…";
-  stat.className = "upstat";
-  stat.textContent = "";
-  clog("上传", "开始", `柜号=${d.awb}`, `ISA=${d.isa || "-"}`, `仓库=${whValue() || "(未选)"}`);
-  try {
-    const r = await fetch("/api/upload", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ record: d, warehouse: whValue() }),
-    }).then((x) => x.json());
-    if (!r.ok) throw new Error(r.error || "上传失败");
-    const it = r.item || {};
-    const trip = it.trip || {};
-    const pal = it.pallet || {};
-    if (pal.error) cerr("上传", `柜号=${d.awb} 实际板数写入失败:`, pal.error);
-    else if (pal.committed) clog("上传", `柜号=${d.awb} 实际板数已更新为 ${pal.value}`);
-    if (it.action === "create" && it.record_id) {
-      clog("上传", `完成 柜号=${d.awb}`, `预约记录=${it.record_id}`,
-        trip.record_id ? `出库计划记录=${trip.record_id} (${trip.table})` : "无出库计划写入");
-      if (trip.error) cerr("上传", `柜号=${d.awb} 出库计划创建失败:`, trip.error);
-      btn.dataset.done = "1"; btn.textContent = "已写入"; btn.classList.add("ok");
-      stat.className = "upstat ok";
-      stat.textContent = "✓ " + it.record_id + tripStat(it) + palletStat(it);
-    } else if (it.action === "create" && it.error) {
-      // 5.6 write itself failed — keep the button usable for a retry
-      cerr("上传", `失败 柜号=${d.awb} 写入 5.6 报错:`, it.error);
-      btn.disabled = false; btn.textContent = prev;
-      stat.className = "upstat err"; stat.textContent = "✗ 写入失败：" + it.error;
-      stat.title = it.error;
-    } else if (it.action === "skip") {
-      console.log("当前派送记录已存在");
-      const tripErr = trip.error;
-      if (trip.record_id)
-        clog("上传", `柜号=${d.awb} 预约已存在，补建出库计划=${trip.record_id} (${trip.table})`);
-      else if (tripErr)
-        cerr("上传", `柜号=${d.awb} 预约已存在，出库计划补建失败:`, tripErr);
-      else
-        clog("上传", `跳过 柜号=${d.awb}`, trip.do === "linked" ? "已关联出库计划" : (trip.note || ""));
-      if (tripErr) { btn.disabled = false; btn.textContent = prev; } // retryable backfill
-      else { btn.dataset.done = "1"; btn.textContent = "已存在"; btn.classList.add("skip"); }
-      stat.className = tripErr ? "upstat err" : "upstat";
-      stat.textContent = "⏭ 当前派送记录已存在" + tripStat(it) + palletStat(it);
-    } else {
-      cerr("上传", `拦截 柜号=${d.awb}:`, it.reason || "已拦截");
-      btn.disabled = false; btn.textContent = prev;
-      stat.className = "upstat err"; stat.textContent = "⛔ " + (it.reason || "已拦截");
-      stat.title = it.reason || "";
-    }
-  } catch (e) {
-    cerr("上传", `失败 柜号=${d.awb}:`, e.message);
-    btn.disabled = false; btn.textContent = prev;
-    stat.className = "upstat err"; stat.textContent = "✗ " + e.message;
-  }
-  delete btn.dataset.busy;
-  updateUploadGate();   // re-sync with the current 仓库供应商 selection
-}
-
-// ---- 5.6 dry-run manifest (read-only) + commit ----
-async function dryRun56(btn) {
-  if (!state.parse || !(state.parse.details || []).length) return;
-  const wh = whValue();
-  if (!wh) { updateUploadGate(); return; }  // gate: need a 仓库供应商
-  btn.disabled = true; const prev = btn.textContent; btn.textContent = "预演中…";
-  const mount = $("#manifest56"); mount.innerHTML = "";
-  mount.append(el("div", { class: "maninfo" }, el("span", { class: "spinner" }), " 预演中…"));
-  clog("预演", "开始", `仓库=${wh || "(未选)"}`, `记录=${state.parse.details.length} 条`);
-  try {
-    const r = await fetch("/api/dryrun_56", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ records: state.parse.details, warehouse: wh }),
-    }).then((x) => x.json());
-    if (!r.ok) throw new Error(r.error || "预演失败");
-    state.commitWarehouse = wh;   // pin what was previewed for the commit step
-    state.lastPlan = r;
-    (r.items || []).filter((it) => it.exists).forEach(() => console.log("当前派送记录已存在"));
-    const s = r.summary || {};
-    clog("预演", "完成（未写入）",
-      `新建=${s.create} 跳过=${s.skip} 拦截=${s.block}`,
-      `出库计划: 新建=${s.trip_create} 补建=${s.trip_backfill}`,
-      `实际板数: 更新=${s.pallet_write} 差异拦截=${s.pallet_block}`,
-      `账号=${r.account || "?"}`, `出库计划表=${r.plan_table || "无"}`);
-    (r.items || []).forEach((it) => {
-      const p = it.pallet || {};
-      if (p.status === "blocked")
-        cerr("预演", `柜号=${it.awb} ISA=${it.isa} 已拦截:`, p.note);
-    });
-    ctable("预演", r.items);
-    renderManifest(mount, r, false);
-  } catch (e) {
-    cerr("预演", "失败:", e.message);
-    mount.innerHTML = ""; mount.append(el("div", { class: "maninfo err" }, "⚠ " + e.message));
-  } finally {
-    btn.disabled = false; btn.textContent = prev;
-    updateUploadGate();   // re-sync with the current 仓库供应商 selection
-  }
-}
-
-// Short trip status suffix for the single-row upload stat line.
-function tripStat(it) {
-  const t = it.trip || {};
-  if (t.record_id) return ` · ${t.table || "出库计划"} ✓`;
-  if (t.error) return ` · 出库计划创建失败`;
-  if (t.do === "linked") return ` · 已关联出库计划`;
-  return "";
-}
-
-// Short 实际板数 status suffix for the single-row upload stat line.
-function palletStat(it) {
-  const p = it.pallet || {};
-  if (p.committed) return ` · 实际板数=${p.value} ✓`;
-  if (p.error) return ` · 实际板数写入失败`;
-  return "";
-}
-
-async function commit56(btn) {
-  const s = state.parse;
-  if (!s) return;
-  // Commit writes the warehouse pinned at dry-run time, never the live
-  // dropdown — otherwise a change after the dry-run could silently target a
-  // different account / delivery-plan table than the manifest the user saw.
-  if (state.commitWarehouse == null) { alert("仓库供应商已更改，请先重新预演"); return; }
-  const p = state.lastPlan || {};
-  if (!confirm(`将真实写入：预约账号=${p.account || "?"} · 出库计划表=${p.plan_table || "无"}\n`
-    + "新建预约写入 5.6（已存在自动跳过），并在出库计划表新建/补建关联记录。确认写入？")) return;
-  btn.disabled = true; btn.textContent = "写入中…";
-  const mount = $("#manifest56");
-  clog("写入", "开始", `仓库=${state.commitWarehouse}`, `账号=${p.account || "?"}`,
-    `出库计划表=${p.plan_table || "无"}`);
-  try {
-    const r = await fetch("/api/commit_56", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ records: s.details, warehouse: state.commitWarehouse }),
-    }).then((x) => x.json());
-    if (!r.ok) throw new Error(r.error || "写入失败");
-    const items = r.items || [];
-    const ok56 = items.filter((it) => it.record_id).length;
-    const fail56 = items.filter((it) => it.action === "create" && !it.record_id).length;
-    const tripOk = items.filter((it) => (it.trip || {}).record_id).length;
-    const tripFail = items.filter((it) => (it.trip || {}).error).length;
-    const palOk = items.filter((it) => (it.pallet || {}).committed).length;
-    const palFail = items.filter((it) => (it.pallet || {}).error).length;
-    (fail56 || tripFail || palFail ? cerr : clog)("写入", "完成",
-      `预约: 已写入=${ok56} 失败=${fail56}`,
-      `出库计划(${r.plan_table || "?"}): 已建=${tripOk} 失败=${tripFail}`,
-      `实际板数: 已更新=${palOk} 失败=${palFail}`);
-    items.forEach((it) => {
-      const t = it.trip || {};
-      const p = it.pallet || {};
-      if (it.error) cerr("写入", `柜号=${it.awb} ISA=${it.isa} 写入 5.6 失败:`, it.error);
-      if (t.error) cerr("写入", `柜号=${it.awb} ISA=${it.isa} 出库计划创建失败:`, t.error);
-      if (p.error) cerr("写入", `柜号=${it.awb} 实际板数写入失败:`, p.error);
-    });
-    ctable("写入", items);
-    renderManifest(mount, r, true);
-  } catch (e) {
-    cerr("写入", "失败:", e.message);
-    btn.disabled = false; btn.textContent = "确认写入";
-    mount.append(el("div", { class: "maninfo err" }, "⚠ 写入失败：" + e.message));
-  }
-}
-
-// Chip for the 出库计划 column of the manifest.
-function tripCell(it, committed) {
-  const t = it.trip || {};
-  const tbl = t.table ? t.table.split(" ")[0] : ""; // "5.2 BESTAR-CAL" -> "5.2"
-  if (t.record_id) return el("span", { class: "chip ok" }, `✓ 已建 ${tbl}`);
-  if (t.error) return el("span", { class: "chip bad", title: t.error }, "创建失败");
-  if (t.do === "create" || t.do === "backfill") {
-    if (committed) return el("span", { class: "chip neu" }, "未执行"); // 5.6 create failed upstream
-    return el("span", { class: "chip " + (t.do === "create" ? "brand" : "warn") },
-      `${t.do === "create" ? "新建" : "补建"} → ${tbl}`);
-  }
-  if (t.do === "linked") return el("span", { class: "chip neu" }, "已关联");
-  return el("span", { class: "nullcell", title: t.note || "" }, t.note || "—");
-}
-
-// Chip for the 实际板数 column of the manifest.
-function palletCell(it, committed) {
-  const p = it.pallet || {};
-  if (p.committed) return el("span", { class: "chip ok" }, `✓ ${p.value}`);
-  if (p.error) return el("span", { class: "chip bad", title: p.error }, "写入失败");
-  if (p.status === "blocked")
-    return el("span", { class: "chip bad", title: p.note || "" }, "差异超限");
-  if (p.status === "conflict")
-    return el("span", { class: "chip bad", title: p.note || "" }, "板数冲突");
-  if (p.status === "keep")
-    return el("span", { class: "chip warn", title: p.note || "" }, "保留现值");
-  if (p.status === "dup")
-    return el("span", { class: "chip neu", title: p.note || "" }, "同批合并");
-  if (p.status === "fill" || p.status === "update") {
-    if (committed || it.action === "block")
-      return el("span", { class: "chip neu" }, "未执行");
-    return el("span", { class: "chip " + (p.status === "fill" ? "brand" : "warn"),
-      title: p.note || "" }, `${p.status === "fill" ? "填入" : "更新"} ${p.value}`);
-  }
-  if (p.status === "same") return el("span", { class: "chip neu" }, "已一致");
-  return el("span", { class: "nullcell", title: p.note || "" }, p.note || "—");
-}
-
-function renderManifest(mount, r, committed) {
-  mount.innerHTML = "";
-  const s = r.summary || { create: 0, skip: 0, block: 0 };
-  const acc = r.account ? `预约账号=${r.account}` : `⚠ ${r.account_reason || "预约账号未定"}`;
-  const items = r.items || [];
-  let head, tripBits = "", palBits = "", prefix;
-  if (committed) {
-    // report what was actually written, not what was planned
-    const ok56 = items.filter((it) => it.record_id).length;
-    const fail56 = items.filter((it) => it.action === "create" && !it.record_id).length;
-    const tripOk = items.filter((it) => (it.trip || {}).record_id).length;
-    const tripFail = items.filter((it) => (it.trip || {}).error).length;
-    const palOk = items.filter((it) => (it.pallet || {}).committed).length;
-    const palFail = items.filter((it) => (it.pallet || {}).error).length;
-    head = `已写入 ${ok56}${fail56 ? ` / 失败 ${fail56}` : ""} · 已存在跳过 ${s.skip} · 拦截 ${s.block} · ${acc}`;
-    if (tripOk || tripFail) tripBits = ` · 出库计划(${r.plan_table || "?"})：已建 ${tripOk}${tripFail ? ` / 失败 ${tripFail}` : ""}`;
-    if (palOk || palFail) palBits = ` · 实际板数：已更新 ${palOk}${palFail ? ` / 失败 ${palFail}` : ""}`;
-    prefix = (fail56 || tripFail || palFail) ? "⚠ 写入结果：" : "✅ 写入结果：";
-  } else {
-    head = `新建 ${s.create} · 已存在跳过 ${s.skip} · 拦截 ${s.block} · ${acc}`;
-    if (s.trip_create || s.trip_backfill)
-      tripBits = ` · 出库计划(${r.plan_table || "?"})：新建 ${s.trip_create || 0} / 补建 ${s.trip_backfill || 0}`;
-    if (s.pallet_write || s.pallet_block)
-      palBits = ` · 实际板数：更新 ${s.pallet_write || 0}${s.pallet_block ? ` / 差异拦截 ${s.pallet_block}` : ""}`;
-    prefix = "🔎 预演（未写入）：";
-  }
-  mount.append(el("div", { class: "maninfo" }, prefix + head + tripBits + palBits));
-
-  const cols = ["柜号", "路线", "ISA", "时间", "动作", "出库计划", "实际板数", "说明"];
-  const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c))));
-  const tbody = el("tbody");
-  for (const it of items) {
-    let cls = "neu", label = it.action;
-    if (it.action === "create") {
-      if (committed && it.record_id) { cls = "ok"; label = "已写入"; }
-      else if (committed) { cls = "bad"; label = "失败"; }
-      else { cls = "brand"; label = "待新建"; }
-    }
-    else if (it.action === "skip") { cls = "warn"; label = "跳过"; }
-    else if (it.action === "block") { cls = "bad"; label = "拦截"; }
-    let note = committed && it.record_id ? ("✓ " + it.record_id)
-      : (it.reason || "") + (it.existing_dest ? `（现${it.existing_dest}）` : "");
-    if (it.error) note += (note ? " · " : "") + "写入失败：" + it.error;
-    if ((it.trip || {}).error) note += (note ? " · " : "") + "出库计划：" + it.trip.error;
-    const pal = it.pallet || {};
-    if (pal.error) note += (note ? " · " : "") + "实际板数：" + pal.error;
-    else if (pal.status === "conflict" || pal.status === "keep")
-      note += (note ? " · " : "") + pal.note;
-    tbody.append(el("tr", {},
-      el("td", {}, it.awb || "-"), el("td", {}, it.route || "-"),
-      el("td", {}, it.isa || "-"), el("td", {}, it.time || "-"),
-      el("td", {}, el("span", { class: "chip " + cls }, label)),
-      el("td", {}, tripCell(it, committed)),
-      el("td", {}, palletCell(it, committed)),
-      el("td", {}, note)));
-  }
-  mount.append(el("div", { class: "tablewrap" }, el("table", {}, thead, tbody)));
-
-  if (!committed && (s.create > 0 || s.trip_backfill > 0 || s.pallet_write > 0)) {
-    const parts = [];
-    if (s.create > 0) parts.push(`新建 ${s.create} 条预约`);
-    if (s.trip_create > 0) parts.push(`新建 ${s.trip_create} 条出库计划`);
-    if (s.trip_backfill > 0) parts.push(`补建 ${s.trip_backfill} 条出库计划`);
-    if (s.pallet_write > 0) parts.push(`更新 ${s.pallet_write} 条实际板数`);
-    const cbtn = el("button", { class: "primary commit" }, `确认写入（${parts.join("，")}）`);
-    cbtn.addEventListener("click", () => commit56(cbtn));
-    mount.append(cbtn);
-  }
-}
+// NOTE: the 5.6 upload/dry-run/commit code that used to live here was removed
+// 2026-08-04. It was a THIRD writer of 5.6 + 出库计划, overlapping ①新建预约
+// and ②计划同步. 文件解析 now only parses and hands rows to those tabs.
+// (Server side: upload_56.py and /api/upload · /api/dryrun_56 · /api/commit_56
+//  were retired at the same time.)
 
 function nullSpan() { return el("span", { class: "nullcell" }, "Null"); }
 function palletText(d) {
@@ -656,14 +406,6 @@ function warehouseCard(f, options) {
     console.log("Null");           // 要求：仓库供应商为 null 时 console 返回 Null
     sel.addEventListener("change", () => {
       console.log("仓库供应商 已选择:", sel.value || "(未选)");
-      // a stale manifest must not be committed against the new warehouse
-      state.commitWarehouse = null;
-      const m = $("#manifest56");
-      if (m && m.innerHTML) {
-        m.innerHTML = "";
-        m.append(el("div", { class: "maninfo" }, "仓库供应商已更改，请重新预演"));
-      }
-      updateUploadGate();   // enable/disable upload buttons to match the choice
     });
     card.append(sel);
     card.append(el("div", { class: "src nullnote" }, "未从文件识别（Null）· 可手动选择"));
@@ -825,9 +567,19 @@ function clip(s) { s = String(s); return s.length > 60 ? s.slice(0, 58) + "…" 
    ═══════════════════════════════════════════════════════════════════════════ */
 const sync = { meta: null, warehouse: null, plan: null, busy: false };
 
-const RE_DEST = /^(YEG|YYC|YVR)[1-9]$/;
+// Destination: SHAPE check only — the real list is the LIVE 5.6 目的地
+// options delivered by /api/sync/meta (sync.meta.dest_options). Never
+// hardcode destinations here: XCAB etc. are managed in Lark, not in code.
+const RE_DEST = /^[A-Z][A-Z0-9•\-]{1,7}$/;
 const RE_ISA = /^\d{8,15}$/;
 const RE_TIME = /^(\d{1,4})[/-](\d{1,2})[/-](\d{1,4})\s+\d{1,2}:\d{2}$/;
+
+// Membership test against the live options; degrades to the shape check
+// while meta is still loading (server re-validates at 预检 regardless).
+function destKnown(d) {
+  const opts = sync.meta && sync.meta.dest_options;
+  return opts && opts.length ? opts.includes(d) : true;
+}
 
 // Mirror of parse_line(): returns {ok, msg} per line — same rejection rules.
 function checkLine(raw) {
@@ -844,7 +596,7 @@ function checkLine(raw) {
   if (t.length === 5 || t.length === 6 || t.length > 8)
     return { ok: false, msg: "带预约时格式应为 [柜号] [路线] [板数] [箱数] [ISA] [日期] [时间] [时区可选]" };
   if (!RE_DEST.test(t[1].toUpperCase()))
-    return { ok: false, msg: `路线「${t[1]}」不合法（YEG/YYC/YVR + 1-9）` };
+    return { ok: false, msg: `路线「${t[1]}」格式不像仓点代码（如 YEG2 / XCAB）` };
   if (!/^\d+$/.test(t[2]) || !/^\d+$/.test(t[3]))
     return { ok: false, msg: "最后两列必须是 [实际板数] [箱数] 两个数字" };
   if (t[2].length >= 9 || t[3].length >= 9)
@@ -888,6 +640,44 @@ async function bootSync() {
         : `预约账号：${w.account} · 出库计划表：${w.plan_table}`;
       gateSyncPlan();
     });
+
+    // ---- 新建预约 tab: its own warehouse selector (账号 mapping only) ----
+    const seg56 = $("#whSeg56");
+    seg56.innerHTML = "";
+    for (const w of r.warehouses) {
+      const b = el("button", { "data-w": w.key, title: w.account
+        ? `预约账号 ${w.account}` : "未配置预约账号 — 无法创建" },
+        w.label + (w.account ? "" : " ⚠"));
+      seg56.append(b);
+    }
+    seg56.addEventListener("click", (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      create56.warehouse = b.dataset.w;
+      [...seg56.children].forEach((x) => x.classList.toggle("on", x === b));
+      const w = r.warehouses.find((x) => x.key === create56.warehouse);
+      $("#whTip56").textContent = w.account
+        ? `将以预约账号「${w.account}」创建缺失的 5.6 预约`
+        : "⚠ 该仓库未配置预约账号 — 所有行将被拦截";
+      gateCreatePlan();
+    });
+
+    // ---- ③核对 tab: warehouse selector ----
+    const segV = $("#whSegV");
+    segV.innerHTML = "";
+    for (const w of r.warehouses) {
+      segV.append(el("button", { "data-w": w.key, title: w.plan_table || "无出库计划表" },
+        w.label + (w.trip_enabled ? "" : " ⚠")));
+    }
+    segV.addEventListener("click", (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      verifyState.warehouse = b.dataset.w;
+      [...segV.children].forEach((x) => x.classList.toggle("on", x === b));
+      const w = r.warehouses.find((x) => x.key === verifyState.warehouse);
+      $("#whTipV").textContent = w.trip_enabled
+        ? `核对链路：3.1 → ${w.plan_table} → 5.6（应有账号 ${w.account}）`
+        : `⚠ ${w.plan_table ? "DEV 环境无该出库计划表副本" : "该仓库无出库计划表"} — 无法核对`;
+      gateVerify();
+    });
   } catch (e) {
     $("#whTip").textContent = "⚠ " + e.message;
   }
@@ -909,6 +699,25 @@ async function bootSync() {
       .forEach((c) => { c.checked = e.target.checked; });
     updateExecCount();
   });
+
+  // ---- 新建预约 tab wiring ----
+  const cta = $("#createInput");
+  cta.addEventListener("input", () => { renderCreateLineChecks(); gateCreatePlan(); });
+  cta.addEventListener("keydown", (e) => {
+    if (e.key !== "Tab") return;
+    e.preventDefault();
+    const [s, epos] = [cta.selectionStart, cta.selectionEnd];
+    cta.value = cta.value.slice(0, s) + "\t" + cta.value.slice(epos);
+    cta.selectionStart = cta.selectionEnd = s + 1;
+    renderCreateLineChecks(); gateCreatePlan();
+  });
+  $("#createPlanBtn").addEventListener("click", planCreate56);
+  $("#createExecBtn").addEventListener("click", execCreate56);
+
+  // ---- ③核对 tab wiring ----
+  $("#verifyInput").addEventListener("input", gateVerify);
+  $("#verifyBtn").addEventListener("click", runVerify);
+
   reattachJob();   // resume a job that was running when the page reloaded
 }
 
@@ -1046,7 +855,13 @@ async function planSync() {
     cerr("预检", "失败:", e.message);
     setSyncStatus([el("span", {}, "⚠ " + e.message)], true);
   } finally {
-    sync.busy = false; btn.textContent = "查询并预检（只读）"; gateSyncPlan();
+    sync.busy = false;
+    btn.textContent = "查询并预检（只读）";
+    gateSyncPlan();
+    // renderSyncRows() ran while busy was still true, so updateExecCount()
+    // disabled 执行. Re-sync it now that busy is cleared — otherwise the
+    // button stays greyed out until a checkbox is clicked.
+    updateExecCount();
   }
 }
 
@@ -1056,26 +871,28 @@ function setSyncStatus(nodes, isErr) {
   s.innerHTML = ""; nodes.forEach((n) => s.append(n));
 }
 
+// Action chips. NOTE: these are 出库计划 (delivery-plan) operations — this tab
+// never creates 预约/appointments (that's ①新建预约). Wording matters: an
+// earlier draft said 「新建行程」 here, which read as "creating appointments".
 const ACTION_LABEL = {
-  fill_pallets: (a) => `填实际板数=${a.value}`,
-  update_isa_time: (a) => `更新预约 → ISA ${a.isa} @ ${a.time}`,
-  link_trip: () => "挂靠行程",
-  create_trip: () => "新建行程",
-  create_isa: (a) => `新建预约 ISA ${a.group_isa}`,
-  set_trip_isa: () => "行程补挂预约",
+  fill_pallets: (a) => `填 3.1 实际板数=${a.value}`,
+  update_isa_time: (a) => `更新已关联预约 → ISA ${a.isa} @ ${a.time}`,
+  link_trip: () => "挂到出库计划",
+  create_trip: () => "新建出库计划(5.x)",
+  set_trip_isa: () => "出库计划补挂预约",
 };
 const PLAN_LABEL = {
   has_plan_match: ["ok", "✓ 计划一致"],
   has_plan_mismatch: ["warn", "计划不一致"],
-  has_plan: ["neu", "已有计划"],
-  has_plan_no_isa: ["warn", "行程缺预约"],
-  no_plan: ["bad", "无派送计划"],
+  has_plan: ["neu", "已有出库计划"],
+  has_plan_no_isa: ["warn", "出库计划缺预约"],
+  no_plan: ["bad", "无出库计划"],
   no_plan_table: ["neu", "不适用"],
   no_dev_plan_table: ["neu", "DEV 停用"],
-  link_existing: ["brand", "挂靠现有行程"],
-  create_trip: ["brand", "新建行程"],
-  create_isa_and_trip: ["brand", "新建预约+行程"],
-  already_on_trip: ["ok", "✓ 已在行程中"],
+  isa_missing: ["bad", "预约不存在"],
+  link_existing: ["brand", "挂到现有出库计划"],
+  create_trip: ["brand", "建出库计划(预约已存在)"],
+  already_on_trip: ["ok", "✓ 已在出库计划中"],
 };
 
 function planCell(row) {
@@ -1084,8 +901,10 @@ function planCell(row) {
   const bits = [el("span", { class: "chip " + cls }, label)];
   if (p.current_isa) bits.push(el("div", { class: "sub" },
     `现挂 ISA ${p.current_isa} @ ${p.current_time || "无时间"}`));
+  if (p.isa_record_id && !p.current_isa) bits.push(el("div", { class: "sub" },
+    "复用已存在的预约"));
   if (p.trip_total !== undefined && p.trip_total !== null)
-    bits.push(el("div", { class: "sub" }, `行程合计约 ${p.trip_total} 板`));
+    bits.push(el("div", { class: "sub" }, `出库计划合计约 ${p.trip_total} 板`));
   return el("div", {}, ...bits);
 }
 
@@ -1210,9 +1029,9 @@ function execSync() {
     for (const act of row.actions)
       counts[act.type] = (counts[act.type] || 0) + 1;
   }
-  const NAMES = { fill_pallets: "填实际板数", update_isa_time: "更新预约ISA/时间",
-    link_trip: "挂靠行程", create_trip: "新建行程(5.x)", create_isa: "新建预约(5.6)",
-    set_trip_isa: "行程补挂预约" };
+  const NAMES = { fill_pallets: "填 3.1 实际板数", update_isa_time: "更新已关联预约ISA/时间",
+    link_trip: "挂到出库计划", create_trip: "新建出库计划(5.x)",
+    set_trip_isa: "出库计划补挂预约" };
   const lines = Object.entries(counts).map(([k, v]) => `  · ${NAMES[k] || k} × ${v}`);
   const envLabel = sync.plan.env === "dev" ? "DEV 测试环境（dev 副本表）" : "‼ PROD 生产环境";
   if (!confirm(`确认执行以下写入？\n\n环境：${envLabel}\n仓库：${sync.plan.warehouse}` +
@@ -1243,7 +1062,8 @@ function renderCommitOutcome(r) {
 // running server-side; reopening re-attaches, but the operator should know)
 window.addEventListener("beforeunload", (e) => {
   const j = sessionStorage.getItem("larkSyncJob");
-  if (j && JSON.parse(j).kind === "commit" && sync.busy) {
+  const kind = j ? JSON.parse(j).kind : null;
+  if ((kind === "commit" && sync.busy) || (kind === "c56commit" && create56.busy)) {
     e.preventDefault();
     e.returnValue = "";
   }
@@ -1306,23 +1126,35 @@ async function reattachJob() {
   if (!r.ok) { forgetJob(); return; }
   const job = r.job;
   if (job.state === "running") {
-    clog("恢复", `重新连接到进行中的${saved.kind === "commit" ? "写入" : "预检"}任务`, job.id);
-    sync.busy = true;
-    showProgress(saved.kind);
+    const isC56 = saved.kind.startsWith("c56");
+    const isCommit = saved.kind.endsWith("commit");
+    clog("恢复", `重新连接到进行中的${isCommit ? "写入" : "预检"}任务`, job.id);
+    if (isC56) { switchTab("create"); create56.busy = true; }
+    else sync.busy = true;
+    showProgress(isCommit ? "commit" : "plan");
     updateProgress(job, false);
     try {
       const finished = await pollJob(job.id, saved.kind);
       hideProgress();
       if (saved.kind === "commit") renderCommitOutcome(finished.result);
-      else renderPlanOutcome(finished.result);
-      if (finished.result && finished.result.warehouse) restoreWarehouse(finished.result.warehouse);
+      else if (saved.kind === "plan") renderPlanOutcome(finished.result);
+      else renderC56(finished.result, saved.kind === "c56commit");
+      const wkey = finished.result && finished.result.warehouse;
+      if (wkey && !isC56) restoreWarehouse(wkey);
+      if (wkey && isC56) {
+        const b = [...$("#whSeg56").children].find((x) => x.dataset.w === wkey);
+        if (b && !b.classList.contains("on")) b.click();
+      }
     } catch (e) {
       hideProgress();
-      setSyncStatus([el("span", {}, "⚠ " + e.message)], true);
+      (isC56 ? setCreateStatus : setSyncStatus)([el("span", {}, "⚠ " + e.message)], true);
     }
     forgetJob();
-    sync.busy = false;
+    if (isC56) create56.busy = false; else sync.busy = false;
     gateSyncPlan();
+    gateCreatePlan();
+    updateExecCount();       // clear the busy-time disable (see planSync)
+    updateCreateExec();
   } else {
     forgetJob();             // finished while we were away — results were seen
   }
@@ -1332,6 +1164,380 @@ function restoreWarehouse(key) {
   const seg = $("#whSeg");
   const b = [...seg.children].find((x) => x.dataset.w === key);
   if (b && !b.classList.contains("on")) b.click();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ➕ 新建预约（仅 5.6）— paste [目的地] [ISA] [时间] lines, create the ISAs
+   that don't exist yet. Mirrors webapp/appointment_create.parse_line for
+   instant validation; server re-validates. Reuses the shared job progress.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const create56 = { warehouse: null, plan: null, busy: false };
+
+function checkCreateLine(raw) {
+  const line = raw.replace(/ |　/g, " ").trim();
+  if (!line) return null;
+  const t = line.split(/\s+/);
+  if (t.length < 4 || t.length > 5)
+    return { ok: false, msg: `列数 ${t.length} 无法解析 — 需要 [目的地] [ISA] [日期] [时间] [时区可选]` };
+  if (!RE_DEST.test(t[0].toUpperCase()))
+    return { ok: false, msg: `目的地「${t[0]}」格式不像仓点代码（如 YEG2 / XCAB）` };
+  if (!destKnown(t[0].toUpperCase()))
+    return { ok: false, msg: `目的地「${t[0]}」不是 5.6 的现有选项 — `
+      + "如需新仓点请先在飞书 5.6 表的「目的地」字段添加选项" };
+  if (!RE_ISA.test(t[1]))
+    return { ok: false, msg: `ISA「${t[1]}」应为 8-15 位数字` };
+  if (!RE_TIME.test(t[2] + " " + t[3]))
+    return { ok: false, msg: `预约时间「${t[2]} ${t[3]}」应为 MM/DD/YYYY HH:MM` };
+  if (t.length === 5 && !/^[A-Z]{2,4}$/i.test(t[4]))
+    return { ok: false, msg: `时区「${t[4]}」无法识别` };
+  return { ok: true, msg: `✓ ${t[0].toUpperCase()} · ISA ${t[1]} @ ${t[2]} ${t[3]}${t[4] ? " " + t[4] : ""}` };
+}
+
+function createLineChecks() {
+  return $("#createInput").value.split("\n")
+    .map((raw, i) => ({ n: i + 1, res: checkCreateLine(raw) }))
+    .filter((x) => x.res !== null);
+}
+
+function renderCreateLineChecks() {
+  const mount = $("#createLines");
+  mount.innerHTML = "";
+  for (const { n, res } of createLineChecks()) {
+    mount.append(el("div", { class: "linechk " + (res.ok ? "ok" : "bad") },
+      el("span", { class: "ln" }, "第" + n + "行"), res.msg));
+  }
+}
+
+function gateCreatePlan() {
+  const checks = createLineChecks();
+  const bad = checks.filter((c) => !c.res.ok).length;
+  const ok = !!create56.warehouse && checks.length > 0 && bad === 0 && !create56.busy;
+  $("#createPlanBtn").disabled = !ok;
+  $("#createGoTip").textContent = !create56.warehouse ? "请先选择仓库供应商"
+    : checks.length === 0 ? "请粘贴预约明细"
+    : bad ? `有 ${bad} 行格式错误 — 修正或删除后才能查询` : "只读预检：逐个检查 ISA 是否已存在";
+}
+
+function setCreateStatus(nodes, isErr) {
+  const s = $("#createStatus");
+  s.hidden = false; s.className = "status" + (isErr ? " err" : "");
+  s.innerHTML = ""; nodes.forEach((n) => s.append(n));
+}
+
+const C56_LABEL = {
+  create: ["brand", "待新建"],
+  exists: ["ok", "已存在 · 跳过"],
+  dup: ["neu", "同批重复"],
+  block: ["bad", "拦截"],
+};
+
+function renderC56(r, committed) {
+  create56.plan = r;
+  const s = r.summary;
+  setCreateStatus(committed ? [
+    el("span", { class: "pill" }, "✅ 已创建 ",
+      el("b", {}, String(r.rows.filter((x) => (x.commit || {}).record_id).length))),
+    el("span", { class: "pill" }, "回读核实 ",
+      el("b", {}, String(r.rows.filter((x) => (x.commit || {}).verified).length))),
+    el("span", { class: "pill" }, `已存在跳过 ${s.exists} · 重复 ${s.dup} · 拦截 ${s.block}`),
+    r.latency && r.latency.created ? el("span", { class: "pill" },
+      `搜索索引延迟 均值 ${r.latency.avg}s（最大 ${r.latency.max}s）`) : null,
+  ].filter(Boolean) : [
+    el("span", { class: "pill" }, "共 ", el("b", {}, String(s.lines)), " 行"),
+    el("span", { class: "pill" }, "待新建 ", el("b", {}, String(s.create))),
+    el("span", { class: "pill" }, `已存在 ${s.exists} · 同批重复 ${s.dup}`),
+    el("span", { class: "pill" + (s.block ? " warnpill" : "") }, `⛔ 拦截 ${s.block}`),
+    el("span", { class: "pill" + (s.warnings ? " warnpill" : "") }, `⚠ 警告 ${s.warnings}`),
+    el("span", { class: "pill" }, `账号 ${r.account || "—"} · 环境 ${r.env.toUpperCase()}`),
+  ]);
+
+  const mount = $("#createResults");
+  mount.innerHTML = "";
+  const cols = ["", "行", "目的地", "ISA", "预约时间", "状态", "说明"];
+  const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c))));
+  const tbody = el("tbody");
+  for (const row of r.rows) {
+    const p = row.parsed || {};
+    const chk = el("input", { type: "checkbox", class: "rowchk56", "data-line": row.line_no });
+    if (row.action !== "create" || committed) chk.disabled = true;
+    else chk.checked = true;
+    chk.addEventListener("change", updateCreateExec);
+
+    let stat;
+    const c = row.commit || {};
+    if (committed && c.record_id) {
+      stat = el("span", { class: "chip ok" },
+        c.verified ? "✓ 已创建并核实" : "✓ 已创建（索引未及时可见）");
+    } else if (committed && c.error) {
+      stat = el("span", { class: "chip bad", title: c.error }, "✗ 失败");
+    } else if (committed && c.skipped) {
+      stat = el("span", { class: "chip warn", title: c.skipped }, "跳过");
+    } else {
+      const [cls, label] = C56_LABEL[row.action] || ["neu", row.action];
+      stat = el("span", { class: "chip " + cls }, label);
+    }
+
+    const notes = el("div", { class: "warnlist" },
+      ...row.warnings.map((w) => el("div", { class: "wline" }, "⚠ " + w)),
+      ...row.blockers.map((b) => el("div", { class: "wline bad" }, "⛔ " + b)),
+      ...(row.notes || []).map((n) => el("div", { class: "nline" }, n)),
+      row.existing ? el("div", { class: "nline" },
+        `表内: ${row.existing.dest || "?"} @ ${row.existing.time || "?"} · `
+        + `${row.existing.account || "?"} (${row.existing.record_id})`) : null,
+      committed && c.record_id ? el("div", { class: "nline" },
+        `record ${c.record_id}`
+        + (c.search_visible_after != null ? ` · 搜索 ${c.search_visible_after}s 后可见` : "")) : null,
+      committed && (c.error || c.note) ? el("div", { class: "wline bad" }, c.error || c.note) : null);
+
+    tbody.append(el("tr", { class: row.action === "block" ? "rowbad" : row.warnings.length ? "rowwarn" : "" },
+      el("td", {}, chk),
+      el("td", {}, String(row.line_no)),
+      el("td", {}, p.dest || "—"),
+      el("td", {}, el("b", {}, p.isa != null ? String(p.isa) : "?")),
+      el("td", {}, p.time ? p.time + (p.tz ? " " + p.tz : "") : "—"),
+      el("td", {}, stat),
+      el("td", { class: "wcol" }, notes)));
+  }
+  mount.append(el("div", { class: "tablewrap" }, el("table", { class: "synctable" }, thead, tbody)));
+
+  $("#createExecBar").hidden = committed || s.create === 0;
+  if (!committed) updateCreateExec();
+  if (committed) renderCreate56Warnings(r);
+}
+
+function updateCreateExec() {
+  const n = document.querySelectorAll("#createResults input.rowchk56:checked:not(:disabled)").length;
+  $("#createExecBtn").textContent = `创建缺失的预约（${n} 条）`;
+  $("#createExecBtn").disabled = n === 0 || create56.busy;
+  $("#createExecTip").textContent = n ? "只创建勾选行 — 已存在的 ISA 绝不重复创建" : "没有待新建的行";
+}
+
+function renderCreate56Warnings(r) {
+  const mount = $("#createWarnings");
+  mount.innerHTML = "";
+  const ws = r.warnings_summary || [];
+  mount.hidden = false;
+  if (!ws.length) {
+    mount.append(el("div", { class: "warnhead ok" }, "✅ 创建完毕 — 无警告"));
+    return;
+  }
+  mount.append(el("div", { class: "warnhead" }, `⚠ 警告汇总（${ws.length} 条）`));
+  const list = el("div", { class: "warnitems" });
+  for (const w of ws) list.append(el("div", { class: "wline" }, "⚠ " + w));
+  mount.append(list);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ③ 核对 — read-only audit: 3.1 → 出库计划 → 预约 for each pasted 柜号.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const verifyState = { warehouse: null, busy: false };
+
+const FLAG_LABEL = {
+  ok: ["ok", "✓ 正确"],
+  missing: ["bad", "无出库计划"],
+  no_isa: ["bad", "出库计划无预约"],
+  isa_diff: ["bad", "ISA 不符"],
+  time_diff: ["warn", "时间不符"],
+  dest_diff: ["bad", "目的地不符"],
+  acct_diff: ["warn", "预约账号不符"],
+  multi_trip: ["warn", "挂多个出库计划"],
+  shared: ["neu", "与其它行共用预约"],
+};
+
+function gateVerify() {
+  const n = $("#verifyInput").value.split("\n").filter((l) => l.trim()).length;
+  const ok = !!verifyState.warehouse && n > 0 && !verifyState.busy;
+  $("#verifyBtn").disabled = !ok;
+  $("#verifyGoTip").textContent = !verifyState.warehouse ? "请先选择仓库供应商"
+    : n === 0 ? "请粘贴要核对的柜号" : `将核对 ${n} 行（只读）`;
+}
+
+function setVerifyStatus(nodes, isErr) {
+  const s = $("#verifyStatus");
+  s.hidden = false; s.className = "status" + (isErr ? " err" : "");
+  s.innerHTML = ""; nodes.forEach((n) => s.append(n));
+}
+
+function renderVerify(r) {
+  const s = r.summary;
+  setVerifyStatus([
+    el("span", { class: "pill" }, "柜号 ", el("b", {}, String(s.lines)),
+      " · 库存行 ", el("b", {}, String(s.rows))),
+    el("span", { class: "pill" + (s.problems ? " warnpill" : "") },
+      s.problems ? `✗ 问题 ${s.problems}` : "✓ 全部正确"),
+    s.errors ? el("span", { class: "pill warnpill" }, `查询失败 ${s.errors}`) : null,
+    el("span", { class: "pill" }, `链路 3.1 → ${r.plan_table || "—"} → 5.6 · ${r.env.toUpperCase()}`),
+  ].filter(Boolean), s.problems > 0);
+
+  const mount = $("#verifyResults");
+  mount.innerHTML = "";
+  const cols = ["柜号", "3.1 路线", "板数(实/预)", "出库计划", "挂到的预约", "结论"];
+  const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c))));
+  const tbody = el("tbody");
+
+  for (const res of r.results) {
+    if (res.error) {
+      tbody.append(el("tr", { class: "rowbad" },
+        el("td", {}, el("b", {}, res.awb || "?")),
+        el("td", { colspan: "5" }, "✗ " + res.error)));
+      continue;
+    }
+    for (const row of res.rows) {
+      const flags = row.flags.length ? row.flags : ["ok"];
+      const a = row.appointment;
+      const exp = res.expected || {};
+      const worst = flags.some((f) => (FLAG_LABEL[f] || [])[0] === "bad") ? "rowbad"
+        : flags.some((f) => (FLAG_LABEL[f] || [])[0] === "warn") ? "rowwarn" : "";
+      tbody.append(el("tr", { class: worst },
+        el("td", {}, el("b", {}, row.awb || res.awb),
+          row.batch ? el("div", { class: "sub" }, row.batch) : null),
+        el("td", {}, row.route || "—"),
+        el("td", {}, `${row.actual || "空"} / ${row.estimated ?? "—"}`,
+          row.boxes != null ? el("div", { class: "sub" }, `${row.boxes} 箱`) : null),
+        el("td", {}, row.trip
+          ? el("div", {}, el("span", { class: "chip neu" }, "✓ 已挂"),
+              el("div", { class: "sub" }, row.trip.record_id))
+          : el("span", { class: "chip bad" }, "无")),
+        el("td", {}, a
+          ? el("div", {}, el("b", {}, String(a.isa ?? "?")),
+              el("div", { class: "sub" }, `${a.dest || "?"} @ ${a.time || "?"} · ${a.account || "?"}`),
+              exp.isa && a.isa !== exp.isa
+                ? el("div", { class: "sub subbad" }, `期望 ISA ${exp.isa}`) : null,
+              exp.time && a.time !== exp.time
+                ? el("div", { class: "sub subbad" }, `期望时间 ${exp.time}`) : null)
+          : el("span", { class: "nullcell" }, "—")),
+        el("td", {}, el("div", { class: "actlist" },
+          ...flags.map((f) => {
+            const [cls, label] = FLAG_LABEL[f] || ["neu", f];
+            return el("span", { class: "chip " + cls }, label);
+          }),
+          row.shared_with && row.shared_with.length
+            ? el("div", { class: "sub" }, `共用于 ${row.shared_with.length} 个其它库存行`) : null))));
+    }
+  }
+  mount.append(el("div", { class: "tablewrap" }, el("table", { class: "synctable" }, thead, tbody)));
+}
+
+async function runVerify() {
+  const btn = $("#verifyBtn");
+  verifyState.busy = true; btn.disabled = true; btn.textContent = "核对中…";
+  $("#verifyResults").innerHTML = "";
+  $("#verifyStatus").hidden = true;
+  showProgress("plan");
+  clog("核对", "开始", `仓库=${verifyState.warehouse}`);
+  try {
+    const r = await fetch("/api/verify", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ warehouse: verifyState.warehouse,
+        text: $("#verifyInput").value }),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "核对失败");
+    rememberJob(r.job.id, "verify");
+    const job = await pollJob(r.job.id, "plan");
+    forgetJob();
+    hideProgress();
+    renderVerify(job.result);
+    clog("核对", "完成（只读）", job.result.summary);
+  } catch (e) {
+    hideProgress();
+    cerr("核对", "失败:", e.message);
+    setVerifyStatus([el("span", {}, "⚠ " + e.message)], true);
+  } finally {
+    verifyState.busy = false; btn.textContent = "开始核对（只读）"; gateVerify();
+  }
+}
+
+// Hand-off from 文件解析: push parsed rows into ① or ② and switch tabs.
+function sendToTab(which, lines) {
+  if (!lines.length) return;
+  if (which === "create") {
+    $("#createInput").value = lines.join("\n");
+    switchTab("create");
+    renderCreateLineChecks(); gateCreatePlan();
+  } else {
+    $("#syncInput").value = lines.join("\n");
+    switchTab("sync");
+    renderLineChecks(); gateSyncPlan();
+  }
+}
+
+async function planCreate56() {
+  const btn = $("#createPlanBtn");
+  create56.busy = true; btn.disabled = true; btn.textContent = "查询中…";
+  $("#createExecBar").hidden = true;
+  $("#createWarnings").hidden = true;
+  $("#createResults").innerHTML = "";
+  $("#createStatus").hidden = true;
+  showProgress("plan");
+  clog("新建预约·预检", "开始", `仓库=${create56.warehouse}`);
+  try {
+    const r = await fetch("/api/create56/plan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ warehouse: create56.warehouse, text: $("#createInput").value }),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "预检失败");
+    rememberJob(r.job.id, "c56plan");
+    const job = await pollJob(r.job.id, "plan");
+    forgetJob();
+    hideProgress();
+    renderC56(job.result, false);
+    clog("新建预约·预检", "完成（只读）", job.result.summary);
+  } catch (e) {
+    hideProgress();
+    cerr("新建预约·预检", "失败:", e.message);
+    setCreateStatus([el("span", {}, "⚠ " + e.message)], true);
+  } finally {
+    create56.busy = false;
+    btn.textContent = "查询并预检（只读）";
+    gateCreatePlan();
+    updateCreateExec();      // same re-sync as planSync — see comment there
+  }
+}
+
+async function execCreate56() {
+  if (!create56.plan) return;
+  const approvals = [...document.querySelectorAll("#createResults input.rowchk56:checked:not(:disabled)")]
+    .map((c) => Number(c.dataset.line))
+    .map((n) => ({ line_no: n, sig: create56.plan.rows.find((x) => x.line_no === n).sig }));
+  if (!approvals.length) return;
+  const envLabel = create56.plan.env === "dev" ? "DEV 测试环境" : "‼ PROD 生产环境";
+  if (!confirm(`确认在 5.6 新建 ${approvals.length} 条预约？\n\n环境：${envLabel}\n`
+    + `预约账号：${create56.plan.account}\n\n已存在的 ISA 会在写入前再次核查，绝不重复创建。`))
+    return;
+  const btn = $("#createExecBtn");
+  create56.busy = true; btn.disabled = true; btn.textContent = "创建中…";
+  $("#createStatus").hidden = true;
+  showProgress("commit");
+  clog("新建预约·执行", "开始", `行=${approvals.length}`);
+  try {
+    const r = await fetch("/api/create56/commit", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ warehouse: create56.warehouse, text: $("#createInput").value,
+        approvals, env: create56.plan.env }),
+    }).then((x) => x.json());
+    if (!r.ok) {
+      if (r.busy) {
+        setCreateStatus([el("span", {}, "⚠ " + r.error + " — 已跟踪其进度")], true);
+        const latest = await fetch("/api/sync/job?id=latest").then((x) => x.json());
+        if (latest.ok && latest.job.state === "running")
+          await pollJob(latest.job.id, "commit").catch(() => {});
+        hideProgress();
+        create56.busy = false; updateCreateExec();
+        return;
+      }
+      throw new Error(r.error || "执行失败");
+    }
+    rememberJob(r.job.id, "c56commit");
+    const job = await pollJob(r.job.id, "commit");
+    forgetJob();
+    hideProgress();
+    renderC56(job.result, true);
+  } catch (e) {
+    hideProgress();
+    cerr("新建预约·执行", "失败:", e.message);
+    setCreateStatus([el("span", {}, "⚠ 执行失败：" + e.message)], true);
+  }
+  create56.busy = false; updateCreateExec(); gateCreatePlan();
 }
 
 // 规范要求：所有警告在最后集中呈现（W1/W2/W3 + 错误），一目了然可复制。

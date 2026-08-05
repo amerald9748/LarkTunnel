@@ -88,10 +88,29 @@ class TestParseLine(unittest.TestCase):
         p = sync.parse_line("CSGU6249922 YVR4 96 7403350996 07/30/2026 13:00 PDT")
         self.assertIn("error", p)
 
-    def test_bad_dest(self):
-        for d in ("YEG0", "YVR10", "YYZ4", "ABC1", "yeg"):
-            p = sync.parse_line(f"OOCU9020713B {d} 4 141")
-            self.assertIn("error", p, d)
+    def test_dest_is_shape_checked_only(self):
+        # The parser accepts any plausible warehouse-point CODE (YEG0, YYZ4,
+        # XCAB, …) — real validity is decided against LIVE Lark options at
+        # plan time (5.6 目的地 for creates; 3.1 search for lookups). A
+        # hardcoded YEG/YYC/YVR list wrongly rejected the live option XCAB
+        # (operator report 2026-08-04).
+        for ok in ("YEG0", "YVR10", "YYZ4", "ABC1", "XCAB"):
+            p = sync.parse_line(f"OOCU9020713B {ok} 4 141")
+            self.assertNotIn("error", p, ok)
+            self.assertEqual(p["dest"], ok)
+        # but plainly-not-a-code tokens still fail the shape check
+        for bad in ("8EG2", "Y", "YEG2YEG2YEG2"):
+            p = sync.parse_line(f"OOCU9020713B {bad} 4 141")
+            self.assertIn("error", p, bad)
+
+    def test_store_time_month_first(self):
+        # 复制时间列 STORES month-first; canonical stays year-first internally
+        self.assertEqual(sync.store_time("2026/08/03 13:00"), "08/03/2026 13:00")
+        # round-trip: stored form re-canonicalizes to the same internal value
+        self.assertEqual(sync.norm_time(sync.store_time("2026/08/03 13:00")),
+                         "2026/08/03 13:00")
+        # legacy year-first strings read back fine too
+        self.assertEqual(sync.norm_time("2025/03/18 20:00"), "2025/03/18 20:00")
 
     def test_lowercase_dest_ok(self):
         p = sync.parse_line("oocu9020713b yeg2 4 141")
@@ -135,21 +154,23 @@ class TestParseBatch(unittest.TestCase):
         rows = sync.parse_batch("\nOOCU9020713B YEG2 4 141\n\n  \nTCNU4251020B YEG1 1 4\n")
         self.assertEqual([r["line_no"] for r in rows], [2, 5])
 
-    def test_duplicate_awb_dest_rejected(self):
-        rows = sync.parse_batch("OOCU9020713B YEG2 4 141\nOOCU9020713B YEG2 5 141")
+    def test_duplicate_awb_dest_allowed_split_shipments(self):
+        # Same 柜号+路线 twice is REAL data (split shipments) — the parser
+        # accepts both; the same-record guard at plan level protects writes.
+        rows = sync.parse_batch("OOCU9733972 YEG1 8 706\nOOCU9733972 YEG1 23 0")
         self.assertNotIn("error", rows[0])
-        self.assertIn("error", rows[1])
-        self.assertIn("重复", rows[1]["error"])
+        self.assertNotIn("error", rows[1])
+
+    def test_zero_boxes_allowed(self):
+        # 箱数 0 is real (loose/overflow shipments) and a disambiguation key
+        p = sync.parse_line("OOCU7443104 YYC4 13 0 129713028975 07/31/2026 18:00 MDT")
+        self.assertNotIn("error", p)
+        self.assertEqual(p["boxes"], 0)
 
     def test_same_awb_different_dest_ok(self):
         rows = sync.parse_batch("OOCU9020713B YEG2 4 141\nOOCU9020713B YEG1 5 99")
         self.assertNotIn("error", rows[0])
         self.assertNotIn("error", rows[1])
-
-    def test_error_lines_do_not_reserve_dedup_key(self):
-        rows = sync.parse_batch("CSGU6249922\tYVR4\t\t96\nCSGU6249922 YVR4 3 96")
-        self.assertIn("error", rows[0])       # malformed
-        self.assertNotIn("error", rows[1])    # the FIXED line must be accepted
 
 
 if __name__ == "__main__":

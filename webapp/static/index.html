@@ -4,6 +4,17 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>LarkTunnel · 到仓核对台</title>
+  <!-- Stamp the theme BEFORE first paint so a dark-mode user never sees a
+       white flash. Mirrors applyTheme() in app.js; localStorage key larkTheme
+       holds 'auto' | 'light' | 'dark'. -->
+  <script>
+    try {
+      var m = localStorage.getItem("larkTheme") || "auto";
+      var dark = m === "dark" || (m === "auto"
+        && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      document.documentElement.dataset.theme = dark ? "dark" : "light";
+    } catch (e) { document.documentElement.dataset.theme = "light"; }
+  </script>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -11,24 +22,47 @@
     <div class="brand">🚇 <b>LarkTunnel</b> <span>到仓核对台</span>
       <span id="envBadge" class="envbadge" hidden></span>
     </div>
-    <div class="hint"><span id="tzNote">—</span></div>
+    <div class="topright">
+      <span class="hint"><span id="tzNote">—</span></span>
+      <button id="themeBtn" class="themebtn" type="button"
+              title="切换主题：自动 / 浅色 / 深色">🌗 自动</button>
+    </div>
   </header>
 
+  <!-- Tab order == the operator's workflow order. Exactly ONE tab writes
+       each table: ① creates 5.6 · ② wires 3.1/出库计划 (+updates linked 5.6)
+       · ③ reads only · 查询/解析 read only. -->
   <nav class="tabs" id="tabs">
-    <button data-tab="sync" class="on">⚡ 预约同步</button>
+    <button data-tab="create" class="on">① 新建预约</button>
+    <button data-tab="sync">② 计划同步</button>
+    <button data-tab="verify">③ 核对</button>
     <button data-tab="query">🔍 库存查询</button>
-    <button data-tab="upload">📄 文件上传</button>
+    <button data-tab="upload">📄 文件解析</button>
   </nav>
 
   <main class="wrap">
+    <!-- shared job progress — visible from ANY tab while plan/commit runs -->
+    <section id="syncProgress" class="progresspanel" hidden>
+      <div class="prowhead">
+        <span class="spinner"></span>
+        <b id="progStage">—</b>
+        <span id="progCount" class="progcount"></span>
+        <span id="progElapsed" class="progelapsed"></span>
+      </div>
+      <div class="pbar"><div id="progFill" class="pbar-fill"></div></div>
+      <div id="progCurrent" class="progcurrent"></div>
+    </section>
 
-    <!-- ═══════════════ ① 预约同步（batch container check-in） ═══════════════ -->
-    <section id="tab-sync" class="tabpane">
+    <!-- ═══════════════ ② 计划同步（3.1 板数 + 出库计划接线） ═══════════════ -->
+    <section id="tab-sync" class="tabpane" hidden>
       <section class="panel controls">
         <div class="stephead"><b>1 · 选择仓库供应商</b>
           <span class="stepnote">决定 3.1 匹配条件、预约账号与出库计划表</span></div>
         <div class="seg wh" id="whSeg"><!-- populated from /api/sync/meta --></div>
         <div class="tip" id="whTip"></div>
+
+        <div class="ownnote">本页<b>只写</b> 3.1 实际板数 与 出库计划关联；预约（5.6）
+          必须先在「① 新建预约」创建 —— 不存在的 ISA 会被拦截，不会在这里新建。</div>
 
         <div class="stephead mt"><b>2 · 粘贴到仓明细</b>
           <span class="stepnote">每行一票：柜号 → 路线 → 实际板数 → 箱数（可选再加 ISA + 预约时间）。
@@ -46,28 +80,84 @@ CXDU2185835&#9;YEG2&#9;2&#9;135&#9;147204024984&#9;07/27/2026 08:00 MDT"></texta
       </section>
 
       <section id="syncStatus" class="status" hidden></section>
-      <section id="syncProgress" class="progresspanel" hidden>
-        <div class="prowhead">
-          <span class="spinner"></span>
-          <b id="progStage">—</b>
-          <span id="progCount" class="progcount"></span>
-          <span id="progElapsed" class="progelapsed"></span>
-        </div>
-        <div class="pbar"><div id="progFill" class="pbar-fill"></div></div>
-        <div id="progCurrent" class="progcurrent"></div>
-      </section>
       <section id="syncResults" class="results"></section>
 
       <div class="execbar" id="execBar" hidden>
         <label class="chkall"><input type="checkbox" id="chkAll" checked /> 全选可执行行</label>
-        <button id="syncExecBtn" class="primary danger">执行选中更新</button>
+        <button id="syncExecBtn" class="primary danger" disabled>执行选中更新</button>
         <span class="tip" id="execTip"></span>
       </div>
 
       <section id="syncWarnings" class="warnpanel" hidden></section>
     </section>
 
-    <!-- ═══════════════ ② 库存查询（原查询台） ═══════════════ -->
+    <!-- ═══════════════ ① 新建预约（仅 5.6） ═══════════════ -->
+    <section id="tab-create" class="tabpane">
+      <section class="panel controls">
+        <div class="stephead"><b>1 · 选择仓库供应商</b>
+          <span class="stepnote">决定写入 5.6 的预约账号（VAST→元浩 等映射自动处理）</span></div>
+        <div class="seg wh" id="whSeg56"><!-- populated from /api/sync/meta --></div>
+        <div class="tip" id="whTip56"></div>
+
+        <div class="ownnote">本页是<b>唯一</b>创建 5.6 预约记录的入口。不改 3.1、
+          不建出库计划、也不修改已存在的预约（改时间请到「② 计划同步」）。</div>
+
+        <div class="stephead mt"><b>2 · 粘贴预约明细</b>
+          <span class="stepnote">每行一条：目的地 → ISA → 预约时间。只新建 5.6 里不存在的
+            ISA，已存在的自动跳过。</span></div>
+        <textarea id="createInput" rows="6" spellcheck="false"
+          placeholder="YVR4&#9;7405010996&#9;08/06/2026 20:00 PDT
+YEG1&#9;7229872996&#9;08/07/2026 08:00 MDT
+YEG2&#9;147683024984&#9;08/05/2026 19:00 MDT"></textarea>
+        <div id="createLines" class="linelist"></div>
+
+        <div class="syncgo">
+          <button id="createPlanBtn" class="primary" disabled>查询并预检（只读）</button>
+          <span class="tip" id="createGoTip">选择仓库并粘贴明细后可查询</span>
+        </div>
+      </section>
+
+      <section id="createStatus" class="status" hidden></section>
+      <section id="createResults" class="results"></section>
+
+      <div class="execbar" id="createExecBar" hidden>
+        <button id="createExecBtn" class="primary danger" disabled>创建缺失的预约</button>
+        <span class="tip" id="createExecTip"></span>
+      </div>
+
+      <section id="createWarnings" class="warnpanel" hidden></section>
+    </section>
+
+    <!-- ═══════════════ ③ 核对（只读：3.1 → 出库计划 → 预约） ═══════════════ -->
+    <section id="tab-verify" class="tabpane" hidden>
+      <section class="panel controls">
+        <div class="stephead"><b>1 · 选择仓库供应商</b>
+          <span class="stepnote">决定 3.1 匹配条件与应有的预约账号</span></div>
+        <div class="seg wh" id="whSegV"><!-- populated from /api/sync/meta --></div>
+        <div class="tip" id="whTipV"></div>
+
+        <div class="ownnote">本页<b>完全只读</b>，不做任何写入。沿着
+          3.1 → 出库计划 → 预约 逐层跟踪，确认预约挂到了正确的库存行。</div>
+
+        <div class="stephead mt"><b>2 · 粘贴要核对的柜号</b>
+          <span class="stepnote">每行一个柜号即可；也可以直接把「② 计划同步」那批明细整段粘进来 —
+            多出来的路线 / ISA / 时间会作为<b>期望值</b>参与比对。</span></div>
+        <textarea id="verifyInput" rows="6" spellcheck="false"
+          placeholder="ZCSU9034790B
+或整段粘贴（带期望值）：
+ZCSU9034790B&#9;YVR4&#9;1&#9;14&#9;7404870996&#9;08/03/2026 13:00 PDT"></textarea>
+
+        <div class="syncgo">
+          <button id="verifyBtn" class="primary" disabled>开始核对（只读）</button>
+          <span class="tip" id="verifyGoTip">选择仓库并粘贴柜号后可核对</span>
+        </div>
+      </section>
+
+      <section id="verifyStatus" class="status" hidden></section>
+      <section id="verifyResults" class="results"></section>
+    </section>
+
+    <!-- ═══════════════ 库存查询（原查询台） ═══════════════ -->
     <section id="tab-query" class="tabpane" hidden>
       <section class="panel controls">
         <div class="grid">
@@ -119,13 +209,16 @@ CXDU2185835&#9;YEG2&#9;2&#9;135&#9;147204024984&#9;07/27/2026 08:00 MDT"></texta
       <section id="results" class="results"></section>
     </section>
 
-    <!-- ═══════════════ ③ 文件上传（原上传识别） ═══════════════ -->
+    <!-- ═══════════════ 文件解析（只读：解析后交给 ①/②） ═══════════════ -->
     <section id="tab-upload" class="tabpane" hidden>
       <section class="panel upload">
         <div class="uphead">
           <b>📄 上传文件自动识别</b>
           <span>从 Excel / CSV 中自动提取 柜号 · 批次号 · 仓库供应商 · 目的地路线 · 预约时间 · ISA（缺失返回 <code>Null</code>）</span>
         </div>
+        <div class="ownnote">本页<b>只解析、不写入</b>。识别结果用下方按钮送到
+          「① 新建预约」或「② 计划同步」，由那两页统一执行写入 —— 避免多个入口
+          重复写同一张表。</div>
         <div id="drop" class="drop">
           <input id="fileInput" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt" hidden />
           <div class="dropinner">

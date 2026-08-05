@@ -215,7 +215,12 @@ module.exports = {
   },
 
   // ---------------------------------------------------------------------------
-  // Enumerations (for input validation)
+  // Enumerations — used by the NODE runbook workflow only.
+  // ⚠ The WEBAPP does NOT read these. It validates destinations against the
+  //   LIVE 5.6「目的地」select options (fetched at runtime, 5-min cache), so
+  //   to add a destination like XCAB: add the option to the 5.6 field in
+  //   Feishu — no config edit, no server restart needed. (Learned 2026-08-04
+  //   when adding XCAB here had no effect on the webapp.)
   // ---------------------------------------------------------------------------
   enums: {
     // Live 仓库供应商 select option names (subset relevant to this workflow).
@@ -225,6 +230,7 @@ module.exports = {
       ...Array.from({ length: 9 }, (_, i) => `YEG${i + 1}`),
       ...Array.from({ length: 9 }, (_, i) => `YYC${i + 1}`),
       ...Array.from({ length: 9 }, (_, i) => `YVR${i + 1}`),
+      'XCAB',
     ],
   },
 
