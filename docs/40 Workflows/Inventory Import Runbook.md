@@ -15,6 +15,16 @@ Registered as the **`lark-inventory-import`** skill
 (`C:\Users\AAAA\.claude\skills\lark-inventory-import\SKILL.md`) so future
 agents trigger it by intent ("import this unloading plan to Lark").
 
+> [!tip] Implemented in the webapp (2026-08-13)
+> The **📦 库存导入** tab of `webapp/` runs this flow interactively: upload
+> the plan → READ-ONLY 预检 (per-route rows with guards) → operator ticks →
+> commit with batch_get read-back verification. Core:
+> `webapp/inventory_import.py` (parsing port of `parse-plan.js` /
+> `pod_generator.py`); endpoints `/api/import/plan|commit`. The webapp path
+> needs no Node/lark-cli and respects `LARK_ENV=dev`. Guards match the CLI,
+> with one refinement: duplicates block **per route** (`exists` → skip)
+> instead of aborting the whole batch.
+
 ## Inputs (4)
 
 | Input | Maps to 字段名 | Example |

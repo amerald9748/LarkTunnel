@@ -27,6 +27,9 @@ FOR EACH 3.1 ROW IT FOLLOWS THE WHOLE CHAIN
     · acct_diff  — appointment 预约账号 ≠ the warehouse's account
     · shared     — the same appointment serves several 3.1 rows (normal for a
                    grouped 预约号; listed so it is a conscious decision)
+    · multi_plan — the appointment has MORE THAN ONE 出库计划 in this plan
+                   table (violates the 1-to-1 invariant, 2026-08-05) —
+                   flagged for manual cleanup
     · ok         — everything lines up
 """
 
@@ -214,8 +217,13 @@ def _verify_awb(p, warehouse, wh, wiring, t31, t56, t5x, isa_usage, usage_lock):
             out.append(row)
             continue
         rec56 = isa_ids[0]
+        link56 = wiring.get("link_on_56")
         a = _batch_get(t56, [rec56], [F56["isa"], F56["time"], F56["dest"],
-                                      F56["account"]]).get(rec56, {})
+                                      F56["account"], link56]).get(rec56, {})
+        # 1-to-1 invariant audit: an appointment must have exactly ONE
+        # 出库计划 in this plan table
+        if len(lark.link_ids(a.get(link56))) > 1:
+            row["flags"].append("multi_plan")
         isa_num = lark.num_of(a.get(F56["isa"]))
         appt = {"record_id": rec56,
                 "isa": int(isa_num) if isa_num is not None else None,

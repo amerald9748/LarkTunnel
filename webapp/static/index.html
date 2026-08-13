@@ -30,9 +30,11 @@
   </header>
 
   <!-- Tab order == the operator's workflow order. Exactly ONE tab writes
-       each table: ① creates 5.6 · ② wires 3.1/出库计划 (+updates linked 5.6)
+       each table: 📦 CREATES 3.1 records (import only, never updates)
+       · ① creates 5.6 · ② wires 3.1/出库计划 (+updates linked 5.6)
        · ③ reads only · 查询/解析 read only. -->
   <nav class="tabs" id="tabs">
+    <button data-tab="import">📦 库存导入</button>
     <button data-tab="create" class="on">① 新建预约</button>
     <button data-tab="sync">② 计划同步</button>
     <button data-tab="verify">③ 核对</button>
@@ -51,6 +53,58 @@
       </div>
       <div class="pbar"><div id="progFill" class="pbar-fill"></div></div>
       <div id="progCurrent" class="progcurrent"></div>
+    </section>
+
+    <!-- ═══════════════ 📦 库存导入（收货派送计划 → 3.1 新建记录） ═══════════════ -->
+    <section id="tab-import" class="tabpane" hidden>
+      <section class="panel controls">
+        <div class="stephead"><b>1 · 选择仓库供应商</b>
+          <span class="stepnote">写入 3.1 仓库供应商 字段（按 3.1 现有选项校验）</span></div>
+        <div class="seg wh" id="whSegImp"><!-- populated from /api/sync/meta --></div>
+        <div class="tip" id="whTipImp"></div>
+
+        <div class="ownnote">本页<b>只新建</b> 3.1 库存记录：解析收货派送计划 Excel，
+          按<b>目的地路线汇总</b>箱数/重量/体积，每条路线一条记录。不修改任何已有记录 —
+          同柜号同路线已存在时自动跳过。</div>
+
+        <div class="stephead mt"><b>2 · 上传收货派送计划</b>
+          <span class="stepnote">自动选择数据工作表、识别表头、展开合并单元格；
+            汇总行自动剔除</span></div>
+        <div id="dropImp" class="drop">
+          <input id="fileImp" type="file" accept=".xlsx,.xlsm" hidden />
+          <div class="dropinner">
+            <span class="big">把 .xlsx 拖到这里</span>
+            <span class="or">或</span>
+            <button id="pickImpBtn" class="primary">选择文件</button>
+            <span class="fmt" id="impFileNote">支持 .xlsx / .xlsm</span>
+          </div>
+        </div>
+
+        <div class="stephead mt"><b>3 · 公共字段</b>
+          <span class="stepnote">写入每条记录：柜号从文件名自动识别，可修改</span></div>
+        <div class="grid">
+          <label class="fld grow"><span>柜号 / AWB</span>
+            <input id="impAwb" type="text" placeholder="例如 BEAU6279991" autocomplete="off" /></label>
+          <label class="fld grow"><span>客户批次号</span>
+            <input id="impBatch" type="text" placeholder="例如 2026-LY-618" autocomplete="off" /></label>
+        </div>
+
+        <div class="syncgo">
+          <button id="impPlanBtn" class="primary" disabled>解析并预检（只读）</button>
+          <span class="tip" id="impGoTip">选择仓库、上传文件并填写公共字段后可预检</span>
+        </div>
+      </section>
+
+      <section id="impStatus" class="status" hidden></section>
+      <section id="impResults" class="results"></section>
+
+      <div class="execbar" id="impExecBar" hidden>
+        <label class="chkall"><input type="checkbox" id="chkAllImp" checked /> 全选待新建行</label>
+        <button id="impExecBtn" class="primary danger" disabled>创建选中记录</button>
+        <span class="tip" id="impExecTip"></span>
+      </div>
+
+      <section id="impWarnings" class="warnpanel" hidden></section>
     </section>
 
     <!-- ═══════════════ ② 计划同步（3.1 板数 + 出库计划接线） ═══════════════ -->

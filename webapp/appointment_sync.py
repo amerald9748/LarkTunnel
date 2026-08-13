@@ -135,6 +135,34 @@ LINK_ON_56 = {
 PALLET_DIFF_WARN = 2   # |提供板数 - 预计板数| > 2  => W1/W2 warning
 TRIP_PALLET_CAP = 28   # trip total pallets > 28    => W3 warning
 
+# ---------------------------------------------------------------------------
+# Recent-trips registry — guards the 1-to-1 预约↔出库计划 invariant across
+# rapid consecutive batches. The 5.6 search index lags fresh link values by
+# ~5 s (measured 2026-08-04), so a second batch committed right after the
+# first could see "appointment has no 出库计划" and create a DUPLICATE
+# (operator-reported 2026-08-05). Every trip this process creates or relinks
+# is recorded here and consulted alongside the live link field.
+# {(env, isa_record_id, plan_table): (trip_id, ts)}
+# ---------------------------------------------------------------------------
+_TRIP_TTL = 600.0
+_RECENT_TRIPS = {}
+_RECENT_TRIPS_LOCK = threading.Lock()
+
+
+def _recent_trip_put(isa_record_id, plan_table, trip_id):
+    with _RECENT_TRIPS_LOCK:
+        _RECENT_TRIPS[(lark.env(), isa_record_id, plan_table)] = (trip_id, time.time())
+
+
+def _recent_trip_get(isa_record_id, plan_table):
+    with _RECENT_TRIPS_LOCK:
+        hit = _RECENT_TRIPS.get((lark.env(), isa_record_id, plan_table))
+        if hit and time.time() - hit[1] <= _TRIP_TTL:
+            return hit[0]
+        if hit:
+            del _RECENT_TRIPS[(lark.env(), isa_record_id, plan_table)]
+        return None
+
 # Destination SHAPE check only (uppercase code like YEG2 / XCAB / YYX2).
 # The AUTHORITATIVE list is the live 5.6 目的地 select options, checked at
 # plan time — never a hardcoded list here, so new bays/codes added in Lark
@@ -593,10 +621,31 @@ def _resolve_isa(ctx, isa):
                              .get(F56["account"]) == ctx["wh"]["account"]), None)
             if best is None:
                 best = hits[0]
-            res = {"rec_id": best["record_id"], "fields": best.get("fields") or {},
+            # The SEARCH index lags field changes by ~5 s (measured) — a link
+            # written moments ago may be missing from `hits`. Re-read the
+            # chosen record via batch_get (record store, authoritative) so
+            # trip-existence decisions never run on stale link values.
+            fresh = _batch_get(ctx["t56"], [best["record_id"]], fields
+                               ).get(best["record_id"])
+            res = {"rec_id": best["record_id"],
+                   "fields": fresh if fresh is not None else (best.get("fields") or {}),
                    "multi": len(hits) > 1}
         ctx["isa_cache"][isa] = res
         return res
+
+
+def _appt_trips(ctx, ex):
+    """出库计划 record ids already serving appointment `ex` in this
+    warehouse's plan table — the 1-to-1 lookup. Combines the (fresh) 5.6
+    link field with the in-process recent-trips registry, so a trip created
+    seconds ago in a previous batch is found even inside the search-index
+    lag window."""
+    link56 = ctx["wiring"].get("link_on_56")
+    ids = lark.link_ids(ex["fields"].get(link56)) if link56 else []
+    recent = _recent_trip_get(ex["rec_id"], ctx["wh"].get("plan_table"))
+    if recent and recent not in ids:
+        ids = [recent] + ids
+    return ids
 
 
 def _plan_row(ctx, p):
@@ -765,9 +814,22 @@ def _plan_row(ctx, p):
                 if ex:
                     if ex["multi"]:
                         W(f"5.6 中 ISA {p['isa']} 存在多条，按最匹配的一条处理")
-                    row["actions"].append({"type": "set_trip_isa", "mode": "attach",
-                                           "trip_id": trip_id,
-                                           "isa_record_id": ex["rec_id"]})
+                    ex_trips = _appt_trips(ctx, ex)
+                    if ex_trips:
+                        # 1-to-1: the appointment already has its 出库计划 —
+                        # move the ROW there instead of attaching a second
+                        # plan to the appointment.
+                        row["actions"].append({"type": "link_trip",
+                                               "record_id": rid,
+                                               "plan_link_field": plan_link_field,
+                                               "trip_id": ex_trips[0],
+                                               "replace": True})
+                        N("该预约已有出库计划 — 本货件移挂过去（原无预约的出库计划保留）")
+                    else:
+                        row["actions"].append({"type": "set_trip_isa",
+                                               "mode": "attach",
+                                               "trip_id": trip_id,
+                                               "isa_record_id": ex["rec_id"]})
                     _check_time_update(row, ctx, ex, p, W)
                 else:
                     _block_missing_isa(row, p)   # keeps has_plan_no_isa context
@@ -797,39 +859,79 @@ def _plan_row(ctx, p):
             N("派送计划的 ISA+时间与提供值一致 — 无需改动")
             return row
 
-        # 4A mismatch — NEWEST-WINS (operator-specified 2026-08-05): the
-        # current paste overwrites the previous plan. Three sub-cases, all
-        # keeping the ISA-uniqueness invariant of 5.6:
-        #   (a) same ISA, new time     -> update the linked record's time
-        #   (b) new ISA that EXISTS as another 5.6 record -> RELINK the
-        #       出库计划's 预约信息 to that record (never rewrite the old one —
-        #       that would duplicate the ISA; this replaced the old blocker).
-        #       The relink propagates to 3.1 via the 5.x ISA/预约时间 formulas.
-        #       If the target record's stored time differs from the paste,
-        #       its 复制时间列 is updated too.
+        # 4A mismatch — NEWEST-WINS (2026-08-05) under the 1-TO-1 INVARIANT
+        # (2026-08-05): each appointment has AT MOST ONE 出库计划 per plan
+        # table; many 3.1 rows may share it iff they share the appointment.
+        #   (a) same ISA, new time -> update the linked record's time.
+        #   (b) new ISA that EXISTS as another 5.6 record ("target"):
+        #       · target already HAS a 出库计划 -> MOVE this 3.1 row onto it
+        #         (rewrite the row's plan link; the duplex link removes it
+        #         from the old 出库计划 automatically). Repointing the old
+        #         出库计划 here would give the target TWO plans — forbidden.
+        #       · target has NO plan and the old 出库计划 carries ONLY this
+        #         row -> repoint that 出库计划 to the target (cheapest move
+        #         that keeps 1-to-1 everywhere).
+        #       · target has NO plan but other shipments stay behind on the
+        #         old 出库计划 -> create the target's plan and move only
+        #         this row (the group shares the one new plan).
+        #       Target's stored time is synced to the paste when it differs.
         #   (c) brand-new ISA (nowhere in 5.6) -> rewrite the linked record
-        #       in place with the new ISA + time (a reschedule keeps its row).
-        # ⚠ All three affect every shipment on the same 出库计划 — intended:
-        #   the whole trip goes to one appointment.
+        #       in place with the new ISA + time (a reschedule keeps its row;
+        #       the appointment↔plan pairing is untouched).
         row["plan"]["status"] = "has_plan_mismatch"
         other = None if same_isa else _resolve_isa(ctx, p["isa"])
         if other and other["rec_id"] != isa_rec_id:
-            # -- (b) relink to the existing target appointment --------------
             if other["multi"]:
                 W(f"5.6 中 ISA {p['isa']} 存在多条，改挂到最匹配的一条")
-            row["actions"].append({"type": "set_trip_isa", "mode": "relink",
-                                   "trip_id": trip_id,
-                                   "isa_record_id": other["rec_id"]})
             other_time = norm_time(lark.flat_text(other["fields"].get(F56["time"])))
             if other_time != p["time"]:
                 row["actions"].append({"type": "update_isa_time",
                                        "isa_record_id": other["rec_id"],
                                        "isa": p["isa"], "time": p["time"]})
-            W(f"派送计划不一致（现 ISA={_n(cur_isa)} → 新 ISA={p['isa']}，"
-              f"该 ISA 已存在于 5.6）— 将把出库计划改挂到该预约"
-              + (f"，并把其时间 {other_time or '空'} 更新为 {p['time']}"
-                 if other_time != p["time"] else "")
-              + f"；原预约（ISA={_n(cur_isa)}）保留不动。影响该出库计划下所有货件")
+            time_note = (f"，并把其时间 {other_time or '空'} 更新为 {p['time']}"
+                         if other_time != p["time"] else "")
+            tgt_trips = _appt_trips(ctx, other)
+            if tgt_trips:
+                # -- move the ROW onto the target's existing 出库计划 --------
+                tgt = tgt_trips[0]
+                if len(tgt_trips) > 1:
+                    W(f"目标预约挂了 {len(tgt_trips)} 个出库计划（应为 1 对 1）— "
+                      f"挂到第一个，请人工清理多余的")
+                tgt_inv = lark.link_ids(_batch_get(t5x, [tgt], [inv_field])
+                                        .get(tgt, {}).get(inv_field))
+                grp_sum = (ctx["groups"].get(p["isa"]) or {}).get("pallet_sum",
+                                                                  provided)
+                tgt_total = _trip_total_pallets(ctx["t31"], tgt_inv) + grp_sum
+                row["plan"]["target_trip"] = tgt
+                row["actions"].append({"type": "link_trip", "record_id": rid,
+                                       "plan_link_field": plan_link_field,
+                                       "trip_id": tgt, "replace": True})
+                if tgt_total > TRIP_PALLET_CAP:
+                    W(f"W3 挂靠后出库计划总板数约 {_n(tgt_total)} 超过 "
+                      f"{TRIP_PALLET_CAP} 板上限")
+                W(f"派送计划不一致（现 ISA={_n(cur_isa)} → 新 ISA={p['isa']}）— "
+                  f"该预约已有出库计划，本货件将移挂到它{time_note}；"
+                  f"原出库计划及其余货件保留不动")
+            elif trip_inv_ids == [rid]:
+                # -- old 出库计划 serves only this row -> repoint it ---------
+                row["actions"].append({"type": "set_trip_isa", "mode": "relink",
+                                       "trip_id": trip_id,
+                                       "isa_record_id": other["rec_id"]})
+                W(f"派送计划不一致（现 ISA={_n(cur_isa)} → 新 ISA={p['isa']}，"
+                  f"该 ISA 已存在于 5.6）— 将把出库计划改挂到该预约{time_note}；"
+                  f"原预约（ISA={_n(cur_isa)}）保留不动")
+            else:
+                # -- others stay behind -> the target gets its own ONE plan --
+                row["actions"].append({"type": "create_trip",
+                                       "group_isa": p["isa"],
+                                       "isa_record_id": other["rec_id"]})
+                row["actions"].append({"type": "link_trip", "record_id": rid,
+                                       "plan_link_field": plan_link_field,
+                                       "trip_id": "@group", "replace": True})
+                _warn_group_cap(ctx, p, W)
+                W(f"派送计划不一致（现 ISA={_n(cur_isa)} → 新 ISA={p['isa']}）— "
+                  f"将为该预约新建出库计划并把本货件移挂过去{time_note}；"
+                  f"原出库计划的其余货件保留不动")
         else:
             # -- (a) time-only update / (c) in-place rewrite to a new ISA ---
             row["actions"].append({"type": "update_isa_time",
@@ -853,13 +955,16 @@ def _plan_row(ctx, p):
         acct = ex["fields"].get(F56["account"])
         if acct and acct != wh["account"]:
             W(f"该 ISA 的预约账号为「{acct}」，与仓库账号「{wh['account']}」不同")
-        link56 = wiring["link_on_56"]
-        trips56 = lark.link_ids(ex["fields"].get(link56))
+        # fresh link + recent-trips registry: a 出库计划 created seconds ago
+        # (previous batch) is found even inside the search-index lag window,
+        # so we NEVER create a second plan for the same appointment
+        trips56 = _appt_trips(ctx, ex)
         if trips56:
             # -- 4B(i): ISA already has a trip -> link this shipment into it
             trip_id = trips56[0]
             if len(trips56) > 1:
-                W(f"该 ISA 关联了 {len(trips56)} 个出库计划，挂靠第一个")
+                W(f"该 ISA 关联了 {len(trips56)} 个出库计划（应为 1 对 1）— "
+                  f"挂靠第一个，请人工清理多余的")
             trip = _batch_get(t5x, [trip_id], [inv_field]).get(trip_id, {})
             trip_inv_ids = lark.link_ids(trip.get(inv_field))
             if rid in trip_inv_ids:
@@ -1056,7 +1161,9 @@ def _commit_locked(warehouse, text, approvals, tick):
             if a["type"] != "create_trip":
                 continue
             isa = a["group_isa"]
-            isa_rec = r["plan"].get("isa_record_id")   # always an EXISTING 5.6 row
+            # the target appointment: carried on the action (4A-b move) or on
+            # the plan context (4B-ii) — always an EXISTING 5.6 record
+            isa_rec = a.get("isa_record_id") or r["plan"].get("isa_record_id")
             if not isa_rec:
                 r.setdefault("commit", {})["error"] = "预约记录缺失，无法创建出库计划"
                 continue
@@ -1070,6 +1177,9 @@ def _commit_locked(warehouse, text, approvals, tick):
                              [t5x, ",".join(map(str, isas))]).get("records", [])
             for isa, rec in zip(isas, made):
                 group_trip_rec[isa] = rec.get("record_id")
+                # 1-to-1 registry: the NEXT batch must find this plan even
+                # while the 5.6 search index still lags the new link
+                _recent_trip_put(trip_jobs[isa][0], plan_table, rec.get("record_id"))
                 for r in trip_jobs[isa][1]:
                     r.setdefault("commit", {})["trip_record_id"] = rec.get("record_id")
         except Exception as e:
@@ -1098,8 +1208,11 @@ def _commit_locked(warehouse, text, approvals, tick):
             api_write("strip", f"/open-apis/bitable/v1/apps/{base}/tables/{t5x}"
                       "/records/batch_update", payload,
                       [t5x, ",".join(j["record_id"] for _, j in set_jobs)])
-            for r, _ in set_jobs:
+            for r, j in set_jobs:
                 r.setdefault("commit", {})["trip_isa_set"] = True
+                # registry: this appointment's ONE plan is now this trip
+                _recent_trip_put(j["fields"][isa_field][0], plan_table,
+                                 j["record_id"])
         except Exception as e:
             for r, _ in set_jobs:
                 r.setdefault("commit", {})["error"] = f"出库计划挂预约失败：{e}"
@@ -1122,8 +1235,10 @@ def _commit_locked(warehouse, text, approvals, tick):
                     r.setdefault("commit", {})["error"] = "出库计划记录缺失，无法关联 3.1"
                     fields = None
                     break
-                # The row reached here via the no-plan branch, so the link
-                # field is empty — writing [trip_id] cannot drop other links.
+                # Writing [trip_id] REPLACES the row's plan link. For no-plan
+                # rows the field was empty anyway; for 1-to-1 moves
+                # (a["replace"]) dropping the OLD link is exactly the point —
+                # the duplex link detaches the row from its previous 出库计划.
                 fields[a["plan_link_field"]] = [trip_id]
         if fields:
             upd31[r["match"]["record_id"]] = (fields, r)

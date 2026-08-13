@@ -678,6 +678,24 @@ async function bootSync() {
         : `⚠ ${w.plan_table ? "DEV 环境无该出库计划表副本" : "该仓库无出库计划表"} — 无法核对`;
       gateVerify();
     });
+
+    // ---- 📦 库存导入 tab: warehouse = the literal 3.1 仓库供应商 value ----
+    // Every option here is usable (even TOR-1140: import only writes the
+    // select value; appointment routing is irrelevant on this tab). The
+    // server re-validates against the LIVE 3.1 options at plan time.
+    const segImp = $("#whSegImp");
+    segImp.innerHTML = "";
+    for (const w of r.warehouses) {
+      segImp.append(el("button", { "data-w": w.key,
+        title: `写入 3.1 仓库供应商 = ${w.key}` }, w.label));
+    }
+    segImp.addEventListener("click", (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      importState.warehouse = b.dataset.w;
+      [...segImp.children].forEach((x) => x.classList.toggle("on", x === b));
+      $("#whTipImp").textContent = `每条新记录写入 仓库供应商 = ${importState.warehouse}`;
+      gateImportPlan();
+    });
   } catch (e) {
     $("#whTip").textContent = "⚠ " + e.message;
   }
@@ -717,6 +735,9 @@ async function bootSync() {
   // ---- ③核对 tab wiring ----
   $("#verifyInput").addEventListener("input", gateVerify);
   $("#verifyBtn").addEventListener("click", runVerify);
+
+  // ---- 📦 库存导入 tab wiring ----
+  wireImportTab();
 
   reattachJob();   // resume a job that was running when the page reloaded
 }
@@ -1065,7 +1086,8 @@ function renderCommitOutcome(r) {
 window.addEventListener("beforeunload", (e) => {
   const j = sessionStorage.getItem("larkSyncJob");
   const kind = j ? JSON.parse(j).kind : null;
-  if ((kind === "commit" && sync.busy) || (kind === "c56commit" && create56.busy)) {
+  if ((kind === "commit" && sync.busy) || (kind === "c56commit" && create56.busy)
+      || (kind === "impcommit" && importState.busy)) {
     e.preventDefault();
     e.returnValue = "";
   }
@@ -1129,9 +1151,11 @@ async function reattachJob() {
   const job = r.job;
   if (job.state === "running") {
     const isC56 = saved.kind.startsWith("c56");
+    const isImp = saved.kind.startsWith("imp");
     const isCommit = saved.kind.endsWith("commit");
     clog("恢复", `重新连接到进行中的${isCommit ? "写入" : "预检"}任务`, job.id);
     if (isC56) { switchTab("create"); create56.busy = true; }
+    else if (isImp) { switchTab("import"); importState.busy = true; }
     else sync.busy = true;
     showProgress(isCommit ? "commit" : "plan");
     updateProgress(job, false);
@@ -1140,21 +1164,30 @@ async function reattachJob() {
       hideProgress();
       if (saved.kind === "commit") renderCommitOutcome(finished.result);
       else if (saved.kind === "plan") renderPlanOutcome(finished.result);
+      else if (isImp) renderImport(finished.result, saved.kind === "impcommit");
       else renderC56(finished.result, saved.kind === "c56commit");
       const wkey = finished.result && finished.result.warehouse;
-      if (wkey && !isC56) restoreWarehouse(wkey);
+      if (wkey && !isC56 && !isImp) restoreWarehouse(wkey);
       if (wkey && isC56) {
         const b = [...$("#whSeg56").children].find((x) => x.dataset.w === wkey);
         if (b && !b.classList.contains("on")) b.click();
       }
+      if (wkey && isImp) {
+        const b = [...$("#whSegImp").children].find((x) => x.dataset.w === wkey);
+        if (b && !b.classList.contains("on")) b.click();
+      }
     } catch (e) {
       hideProgress();
-      (isC56 ? setCreateStatus : setSyncStatus)([el("span", {}, "⚠ " + e.message)], true);
+      (isC56 ? setCreateStatus : isImp ? setImpStatus : setSyncStatus)(
+        [el("span", {}, "⚠ " + e.message)], true);
     }
     forgetJob();
-    if (isC56) create56.busy = false; else sync.busy = false;
+    if (isC56) create56.busy = false;
+    else if (isImp) importState.busy = false;
+    else sync.busy = false;
     gateSyncPlan();
     gateCreatePlan();
+    gateImportPlan();
     updateExecCount();       // clear the busy-time disable (see planSync)
     updateCreateExec();
   } else {
@@ -1343,6 +1376,7 @@ const FLAG_LABEL = {
   dest_diff: ["bad", "目的地不符"],
   acct_diff: ["warn", "预约账号不符"],
   multi_trip: ["warn", "挂多个出库计划"],
+  multi_plan: ["bad", "预约有多个出库计划(应1对1)"],
   shared: ["neu", "与其它行共用预约"],
 };
 
@@ -1540,6 +1574,293 @@ async function execCreate56() {
     setCreateStatus([el("span", {}, "⚠ 执行失败：" + e.message)], true);
   }
   create56.busy = false; updateCreateExec(); gateCreatePlan();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   📦 库存导入 — upload 收货派送计划 -> per-route aggregation -> READ-ONLY plan
+   -> tick rows -> commit (3.1 batch_create) with read-back verify.
+   Mirrors webapp/inventory_import.py; server is authoritative.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const importState = { warehouse: null, plan: null, busy: false, file: null };
+
+// Container id from a file name, e.g. "BEAU6279991  收货派送计划.xlsx".
+const RE_IMP_CONTAINER = /([A-Z]{4}\d{7}[A-Z]?)(?![A-Z])/;
+const RE_IMP_AWBNUM = /(\d{3}-\d{7})/;
+
+function wireImportTab() {
+  const drop = $("#dropImp"), input = $("#fileImp");
+  $("#pickImpBtn").addEventListener("click", (e) => { e.preventDefault(); input.click(); });
+  input.addEventListener("change", () => { if (input.files[0]) takeImportFile(input.files[0]); });
+  ["dragenter", "dragover"].forEach((ev) =>
+    drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach((ev) =>
+    drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", (e) => {
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) takeImportFile(f);
+  });
+  $("#impAwb").addEventListener("input", gateImportPlan);
+  $("#impBatch").addEventListener("input", gateImportPlan);
+  $("#impPlanBtn").addEventListener("click", planImport);
+  $("#impExecBtn").addEventListener("click", execImport);
+  $("#chkAllImp").addEventListener("change", (e) => {
+    document.querySelectorAll("#impResults input.rowchkimp:not(:disabled)")
+      .forEach((c) => { c.checked = e.target.checked; });
+    updateImpExec();
+  });
+}
+
+async function takeImportFile(f) {
+  if (!/\.(xlsx|xlsm)$/i.test(f.name)) {
+    $("#impFileNote").textContent = "⚠ 只支持 .xlsx / .xlsm（旧版 .xls 请另存为 .xlsx）";
+    return;
+  }
+  try {
+    const b64 = await fileToBase64(f);
+    importState.file = { name: f.name, b64 };
+    $("#impFileNote").textContent = `已选择 ${f.name}（${(f.size / 1024).toFixed(1)} KB）`;
+    clog("导入", "文件就绪", f.name);
+    // Auto-fill the AWB from the file name — editable, never overwrites input.
+    if (!$("#impAwb").value.trim()) {
+      const up = f.name.toUpperCase();
+      const m = RE_IMP_CONTAINER.exec(up) || RE_IMP_AWBNUM.exec(up);
+      if (m) { $("#impAwb").value = m[1]; clog("导入", "从文件名识别柜号", m[1]); }
+    }
+  } catch (e) {
+    importState.file = null;
+    $("#impFileNote").textContent = "⚠ 读取文件失败：" + e.message;
+  }
+  gateImportPlan();
+}
+
+function gateImportPlan() {
+  const ok = !!importState.warehouse && !!importState.file
+    && $("#impAwb").value.trim() && $("#impBatch").value.trim() && !importState.busy;
+  $("#impPlanBtn").disabled = !ok;
+  $("#impGoTip").textContent = !importState.warehouse ? "请先选择仓库供应商"
+    : !importState.file ? "请上传收货派送计划 .xlsx"
+    : !$("#impAwb").value.trim() ? "请填写柜号 / AWB"
+    : !$("#impBatch").value.trim() ? "请填写客户批次号"
+    : "只读预检：解析文件、查重 3.1、校验选项 — 不写入任何数据";
+}
+
+function setImpStatus(nodes, isErr) {
+  const s = $("#impStatus");
+  s.hidden = false; s.className = "status" + (isErr ? " err" : "");
+  s.innerHTML = ""; nodes.forEach((n) => s.append(n));
+}
+
+function importPayload() {
+  return {
+    filename: importState.file.name,
+    content_b64: importState.file.b64,
+    awb: $("#impAwb").value.trim(),
+    batch: $("#impBatch").value.trim(),
+    warehouse: importState.warehouse,
+  };
+}
+
+async function planImport() {
+  const btn = $("#impPlanBtn");
+  importState.busy = true; btn.disabled = true; btn.textContent = "解析中…";
+  $("#impExecBar").hidden = true;
+  $("#impWarnings").hidden = true;
+  $("#impResults").innerHTML = "";
+  $("#impStatus").hidden = true;
+  showProgress("plan");
+  clog("导入·预检", "开始", `仓库=${importState.warehouse}`);
+  try {
+    const r = await fetch("/api/import/plan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(importPayload()),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "预检失败");
+    rememberJob(r.job.id, "impplan");
+    const job = await pollJob(r.job.id, "plan");
+    forgetJob();
+    hideProgress();
+    renderImport(job.result, false);
+    clog("导入·预检", "完成（只读）", job.result.summary);
+  } catch (e) {
+    hideProgress();
+    cerr("导入·预检", "失败:", e.message);
+    setImpStatus([el("span", {}, "⚠ " + e.message)], true);
+  } finally {
+    importState.busy = false;
+    btn.textContent = "解析并预检（只读）";
+    gateImportPlan();
+    updateImpExec();       // same busy-time re-sync as planSync
+  }
+}
+
+const IMP_LABEL = {
+  create: ["brand", "待新建"],
+  exists: ["ok", "已存在 · 跳过"],
+  block: ["bad", "拦截"],
+};
+
+function renderImport(r, committed) {
+  importState.plan = r;
+  const s = r.summary;
+  const t = r.totals || {};
+  setImpStatus(committed ? [
+    el("span", { class: "pill" }, "✅ 已创建 ",
+      el("b", {}, String(r.rows.filter((x) => (x.commit || {}).record_id).length))),
+    el("span", { class: "pill" }, "回读核实 ",
+      el("b", {}, String(r.rows.filter((x) => (x.commit || {}).verified === true).length))),
+    el("span", { class: "pill" }, `已存在跳过 ${s.exists} · 拦截 ${s.block}`),
+    el("span", { class: "pill" }, `环境 ${r.env.toUpperCase()}`),
+  ] : [
+    el("span", { class: "pill" }, "路线 ", el("b", {}, String(s.dests)),
+      " · 明细 ", el("b", {}, String(t.rows ?? "—")), " 行"),
+    el("span", { class: "pill" }, "待新建 ", el("b", {}, String(s.create))),
+    el("span", { class: "pill" + (s.exists ? " warnpill" : "") }, `已存在 ${s.exists}`),
+    el("span", { class: "pill" + (s.block ? " warnpill" : "") }, `⛔ 拦截 ${s.block}`),
+    el("span", { class: "pill" + (s.warnings ? " warnpill" : "") }, `⚠ 警告 ${s.warnings}`),
+    el("span", { class: "pill" },
+      `文件合计 ${t.boxes} 箱 · ${t.weight} kg · ${t.volume} m³`),
+    el("span", { class: "pill" },
+      `工作表「${r.sheet}」表头第 ${r.header_row} 行 · 环境 ${r.env.toUpperCase()}`),
+  ], false);
+
+  const mount = $("#impResults");
+  mount.innerHTML = "";
+  const cols = ["", "目的地路线", "明细行", "箱数", "重量 (kg)", "体积 (m³)", "状态", "说明"];
+  const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c))));
+  const tbody = el("tbody");
+  for (const row of r.rows) {
+    const chk = el("input", { type: "checkbox", class: "rowchkimp", "data-dest": row.dest });
+    if (row.action !== "create" || committed) chk.disabled = true;
+    else chk.checked = true;
+    chk.addEventListener("change", updateImpExec);
+
+    let stat;
+    const c = row.commit || {};
+    if (committed && c.record_id) {
+      stat = el("span", { class: c.verified === true ? "chip ok" : "chip bad" },
+        c.verified === true ? "✓ 已创建并回读核实" : "⚠ 已创建但核实未通过");
+    } else if (committed && c.error) {
+      stat = el("span", { class: "chip bad", title: c.error }, "✗ 失败");
+    } else if (committed && c.skipped) {
+      stat = el("span", { class: "chip warn", title: c.skipped }, "跳过");
+    } else {
+      const [cls, label] = IMP_LABEL[row.action] || ["neu", row.action];
+      stat = el("span", { class: "chip " + cls }, label);
+    }
+
+    const notes = el("div", { class: "warnlist" },
+      ...row.warnings.map((w) => el("div", { class: "wline" }, "⚠ " + w)),
+      ...row.blockers.map((b) => el("div", { class: "wline bad" }, "⛔ " + b)),
+      ...(row.notes || []).map((n) => el("div", { class: "nline" }, n)),
+      committed && c.record_id ? el("div", { class: "nline" }, `record ${c.record_id}`) : null,
+      committed && (c.error || c.note) ? el("div", { class: "wline bad" }, c.error || c.note) : null,
+      ...(committed && c.checks ? c.checks.filter((k) => !k.ok).map((k) =>
+        el("div", { class: "wline" }, `✗ ${k.what}（回读=${k.got}）`)) : []));
+
+    tbody.append(el("tr", { class: row.action === "block" ? "rowbad" : row.warnings.length ? "rowwarn" : "" },
+      el("td", {}, chk),
+      el("td", {}, el("b", {}, row.dest)),
+      el("td", {}, String(row.plan_rows)),
+      el("td", {}, String(row.boxes)),
+      el("td", {}, String(row.weight)),
+      el("td", {}, String(row.volume)),
+      el("td", {}, stat),
+      el("td", { class: "wcol" }, notes)));
+  }
+  mount.append(el("div", { class: "tablewrap" }, el("table", { class: "synctable" }, thead, tbody)));
+
+  $("#impExecBar").hidden = committed || s.create === 0;
+  if (!committed) updateImpExec();
+  if (committed) renderImpWarnings(r);
+}
+
+function updateImpExec() {
+  const n = document.querySelectorAll("#impResults input.rowchkimp:checked:not(:disabled)").length;
+  $("#impExecBtn").textContent = `创建选中记录（${n} 条）`;
+  const noFile = !importState.file;
+  $("#impExecBtn").disabled = n === 0 || importState.busy || noFile;
+  $("#impExecTip").textContent = noFile ? "页面已刷新，文件内容丢失 — 请重新选择文件并预检"
+    : n ? `将在 3.1 新建 ${n} 条记录 — 双重确认后才写入` : "没有待新建的行";
+}
+
+function execImport() {
+  if (!importState.plan || !importState.file) return;
+  const approvals = [...document.querySelectorAll("#impResults input.rowchkimp:checked:not(:disabled)")]
+    .map((c) => c.dataset.dest)
+    .map((d) => {
+      const row = importState.plan.rows.find((x) => x.dest === d);
+      return { dest: d, sig: row.sig };
+    });
+  if (!approvals.length) return;
+  const p = importState.plan;
+  const envLabel = p.env === "dev" ? "DEV 测试环境（dev 副本表）" : "‼ PROD 生产环境";
+  const lines = approvals.map((a) => {
+    const row = p.rows.find((x) => x.dest === a.dest);
+    return `  · ${row.dest}：${row.boxes} 箱 · ${row.weight} kg · ${row.volume} m³`;
+  });
+  if (!confirm(`确认在 3.1 新建 ${approvals.length} 条库存记录？\n\n环境：${envLabel}\n`
+    + `柜号：${p.awb} · 批次：${p.batch} · 仓库：${p.warehouse}\n\n${lines.join("\n")}\n\n`
+    + `写入前会重新查重 — 已存在的路线绝不重复创建。`))
+    return;
+  runImportCommit(approvals);
+}
+
+async function runImportCommit(approvals) {
+  const btn = $("#impExecBtn");
+  importState.busy = true; btn.disabled = true; btn.textContent = "创建中…";
+  $("#impStatus").hidden = true;
+  showProgress("commit");
+  clog("导入·执行", "开始", `路线=${approvals.length}`, `环境=${importState.plan.env}`);
+  try {
+    const r = await fetch("/api/import/commit", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...importPayload(), approvals, env: importState.plan.env }),
+    }).then((x) => x.json());
+    if (!r.ok) {
+      if (r.busy) {
+        setImpStatus([el("span", {}, "⚠ " + r.error + " — 已跟踪其进度")], true);
+        const latest = await fetch("/api/sync/job?id=latest").then((x) => x.json());
+        if (latest.ok && latest.job.state === "running")
+          await pollJob(latest.job.id, "commit").catch(() => {});
+        hideProgress();
+        importState.busy = false; updateImpExec();
+        return;
+      }
+      throw new Error(r.error || "执行失败");
+    }
+    rememberJob(r.job.id, "impcommit");
+    const job = await pollJob(r.job.id, "commit");
+    forgetJob();
+    hideProgress();
+    renderImport(job.result, true);
+    clog("导入·执行", "完成", job.result.summary);
+  } catch (e) {
+    hideProgress();
+    cerr("导入·执行", "失败:", e.message);
+    setImpStatus([el("span", {}, "⚠ 执行失败：" + e.message)], true);
+  }
+  importState.busy = false; updateImpExec(); gateImportPlan();
+}
+
+function renderImpWarnings(r) {
+  const mount = $("#impWarnings");
+  mount.innerHTML = "";
+  const ws = r.warnings_summary || [];
+  mount.hidden = false;
+  if (!ws.length) {
+    mount.append(el("div", { class: "warnhead ok" }, "✅ 导入完毕 — 无警告"));
+    return;
+  }
+  mount.append(el("div", { class: "warnhead" }, `⚠ 警告汇总（${ws.length} 条）— 请人工复核`));
+  const list = el("div", { class: "warnitems" });
+  for (const w of ws) list.append(el("div", { class: "wline" }, "⚠ " + w));
+  mount.append(list);
+  const btn = el("button", { class: "mini" }, "复制警告");
+  btn.addEventListener("click", () => {
+    navigator.clipboard.writeText(ws.join("\n"));
+    btn.textContent = "已复制";
+  });
+  mount.append(btn);
 }
 
 // 规范要求：所有警告在最后集中呈现（W1/W2/W3 + 错误），一目了然可复制。

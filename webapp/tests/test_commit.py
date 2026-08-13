@@ -86,6 +86,8 @@ class CommitCase(unittest.TestCase):
         for p in self.patches:
             p.start()
         self.addCleanup(lambda: [p.stop() for p in self.patches])
+        sync._RECENT_TRIPS.clear()          # per-test 1-to-1 registry
+        self.addCleanup(sync._RECENT_TRIPS.clear)
 
     def approve_all(self, planned):
         return [{"line_no": r["line_no"], "sig": r["sig"]}
@@ -171,6 +173,50 @@ class TestCommitPhases(CommitCase):
         self.assertTrue(row["commit"]["verified"], row["commit"]["checks"])
         self.assertTrue(any(c["what"] == "出库计划改挂预约" and c["ok"]
                             for c in row["commit"]["checks"]))
+
+    def test_move_row_to_target_plan_commits_one_to_one(self):
+        # 1-to-1: target appointment already owns trip2 -> the ROW moves onto
+        # trip2 (3.1 link rewrite); the old trip keeps its appointment, no
+        # trip create, no repoint.
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=9903350996, time="2026/07/30 13:00",
+                    trip_links=["trip2"]),
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
+        self.fx.trips["trip2"] = make_trip(inv_ids=[], isa_ids=["other"])
+        planned = sync.plan("VAST", LINE_A)
+        res = sync.commit("VAST", LINE_A, self.approve_all(planned), "prod")
+
+        kinds = [(k, t) for k, t, _, _ in self.fx.calls]
+        self.assertEqual(kinds, [("update", T31)])        # ONE write: the move
+        row31 = self.fx.rows31[0]["fields"]["5.4 VAST-VAN-01"]
+        self.assertEqual(row31["link_record_ids"], ["trip2"])
+        # old appointment record untouched; no trip was created
+        self.assertEqual(len(self.fx.trips), 2)
+        row = next(r for r in res["rows"] if r.get("approved"))
+        self.assertTrue(row["commit"]["verified"], row["commit"]["checks"])
+
+    def test_create_trip_uses_target_appointment_from_action(self):
+        # 4A-b "others stay behind": the new plan must link the TARGET
+        # appointment (from the action), not the row's old linked one
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=9903350996, time="2026/07/30 13:00"),
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a", "r31z"],
+                                           isa_ids=["linked"])
+        planned = sync.plan("VAST", LINE_A)
+        sync.commit("VAST", LINE_A, self.approve_all(planned), "prod")
+        ctrip = next(p for k, t, p, _ in self.fx.calls
+                     if (k, t) == ("create", T54))
+        self.assertEqual(ctrip["records"][0]["fields"]["预约信息"], ["other"])
+        # and the row moved onto the NEW trip, off trip1
+        new_trip = [tid for tid in self.fx.trips if tid.startswith("new")][0]
+        self.assertEqual(self.fx.rows31[0]["fields"]["5.4 VAST-VAN-01"]
+                         ["link_record_ids"], [new_trip])
 
     def test_partial_approval_writes_only_approved(self):
         self.fx.rows31 = [make_31("a"), make_31("b", awb="TCNU4251020B", dest="YVR2")]

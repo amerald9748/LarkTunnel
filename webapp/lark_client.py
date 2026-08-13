@@ -258,9 +258,14 @@ def _api(method, path, payload=None, query=None):
             r = _http(method, url, headers={"Authorization": f"Bearer {tok}"},
                       payload=payload)
         except LarkError as e:
-            if e.code == "net" and i < attempts - 1:
+            # transient = network faults AND Feishu-side 5xx (e.g. code 2200
+            # "get app user failed" seen live 2026-08-14) — safe to retry for
+            # reads / token-carrying writes
+            transient = (e.code == "net"
+                         or (isinstance(e.code, int) and e.code >= 500))
+            if transient and i < attempts - 1:
                 last = e
-                continue                        # transient — retry
+                continue
             raise
         if r.get("code") != 0:
             raise LarkError(f"Feishu API error code {r.get('code')}: {r.get('msg')}",

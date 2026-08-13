@@ -107,6 +107,8 @@ class PlannerCase(unittest.TestCase):
         for p in self.patches:
             p.start()
         self.addCleanup(lambda: [p.stop() for p in self.patches])
+        sync._RECENT_TRIPS.clear()          # per-test 1-to-1 registry
+        self.addCleanup(sync._RECENT_TRIPS.clear)
 
     def plan1(self, line, warehouse="VAST"):
         r = sync.plan(warehouse, line)
@@ -375,6 +377,61 @@ class TestStep4BNoPlan(PlannerCase):
         self.assertEqual(upd["isa_record_id"], "other")     # target, NOT linked
         self.assertEqual(upd["time"], "2026/07/30 13:00")
         self.assertTrue(any("改挂" in w for w in row["warnings"]))
+
+    def test_new_isa_with_existing_plan_moves_row_not_trip(self):
+        """1-to-1 invariant (2026-08-05): when the target appointment ALREADY
+        has a 出库计划, the 3.1 row moves onto it — the old trip is NOT
+        repointed (that would give the target two plans)."""
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=7403350996, time="2026/07/30 13:00",
+                    trip_links=["trip2"]),
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
+        self.fx.trips["trip2"] = make_trip(inv_ids=[], isa_ids=["other"])
+        row = self.plan1(LINE_FULL)
+        types = self.action_types(row)
+        self.assertNotIn("set_trip_isa", types)          # no repoint
+        self.assertNotIn("create_trip", types)           # no second plan
+        move = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(move["trip_id"], "trip2")
+        self.assertTrue(move.get("replace"))
+        self.assertTrue(any("移挂" in w for w in row["warnings"]))
+
+    def test_new_isa_no_plan_but_shared_old_trip_creates_target_plan(self):
+        # old 出库计划 carries ANOTHER shipment too -> repointing it would
+        # drag that shipment along; instead the target gets its own ONE plan
+        # and only this row moves
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=7403350996, time="2026/07/30 13:00"),
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a", "r31z"],
+                                           isa_ids=["linked"])
+        row = self.plan1(LINE_FULL)
+        types = self.action_types(row)
+        self.assertNotIn("set_trip_isa", types)
+        create = next(a for a in row["actions"] if a["type"] == "create_trip")
+        self.assertEqual(create["isa_record_id"], "other")   # the TARGET appt
+        move = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(move["trip_id"], "@group")
+        self.assertTrue(move.get("replace"))
+
+    def test_recent_trip_registry_defeats_search_lag(self):
+        """A plan created moments ago (previous batch) must be found even
+        while the 5.6 search index still shows no link — otherwise a second
+        plan gets created for the same appointment (operator-reported)."""
+        self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56("appt", isa=7403350996)]   # link NOT visible
+        sync._recent_trip_put("appt", "5.4 VAST-VAN-01", "tripX")
+        self.fx.trips["tripX"] = make_trip(inv_ids=[], isa_ids=["appt"])
+        row = self.plan1(LINE_FULL)
+        types = self.action_types(row)
+        self.assertNotIn("create_trip", types)               # no duplicate
+        link = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(link["trip_id"], "tripX")           # joins via registry
 
     def test_relink_without_time_update_when_target_time_matches(self):
         self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]

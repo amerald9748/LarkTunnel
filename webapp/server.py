@@ -22,6 +22,7 @@ import lark_client as lark
 import file_parse
 import appointment_sync
 import appointment_create
+import inventory_import
 import verify_assignments
 import sync_jobs
 
@@ -276,6 +277,36 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
         return self._send_json({"ok": True, "job": job})
 
+    # ---- 库存导入（收货派送计划 → 3.1 新建记录）— same job pattern ----------
+    def _handle_import_plan(self, payload):
+        def run(progress):
+            return inventory_import.plan(payload, progress=progress)
+        try:
+            job = sync_jobs.start("plan", run)
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
+        return self._send_json({"ok": True, "job": job})
+
+    def _handle_import_commit(self, payload):
+        approvals = payload.get("approvals") or []
+        client_env = payload.get("env") or ""
+        if client_env != lark.env():
+            return self._send_json(
+                {"ok": False, "error": f"环境不匹配：页面为 {client_env}，"
+                                       f"服务端为 {lark.env()} — 请刷新页面"}, 200)
+
+        def run(progress):
+            return inventory_import.commit(payload, approvals, client_env,
+                                           progress=progress)
+        try:
+            # kind 'commit' => single-flight across ALL webapp write flows
+            job = sync_jobs.start("commit", run)
+        except sync_jobs.Busy as e:
+            return self._send_json({"ok": False, "busy": True, "error": str(e)}, 200)
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
+        return self._send_json({"ok": True, "job": job})
+
     # ---- ③核对 (READ-ONLY audit of the finished assignments) ---------------
     def _handle_verify(self, payload):
         warehouse = payload.get("warehouse") or ""
@@ -297,6 +328,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path not in ("/api/query", "/api/parse",
                                "/api/sync/plan", "/api/sync/commit",
                                "/api/create56/plan", "/api/create56/commit",
+                               "/api/import/plan", "/api/import/commit",
                                "/api/verify"):
             return self.send_error(404, "Not found")
         try:
@@ -317,6 +349,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_create56_plan(payload)
         if parsed.path == "/api/create56/commit":
             return self._handle_create56_commit(payload)
+        if parsed.path == "/api/import/plan":
+            return self._handle_import_plan(payload)
+        if parsed.path == "/api/import/commit":
+            return self._handle_import_commit(payload)
         if parsed.path == "/api/verify":
             return self._handle_verify(payload)
 
