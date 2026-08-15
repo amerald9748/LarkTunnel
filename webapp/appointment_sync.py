@@ -639,12 +639,29 @@ def _appt_trips(ctx, ex):
     warehouse's plan table — the 1-to-1 lookup. Combines the (fresh) 5.6
     link field with the in-process recent-trips registry, so a trip created
     seconds ago in a previous batch is found even inside the search-index
-    lag window."""
+    lag window.
+
+    LEGACY DUPLICATES: 360 appointments in prod predate this invariant and
+    hold 2–3 出库计划 (operator decided 2026-08-14 not to repair history).
+    Callers take ids[0], so when several exist we return the DOMINANT one
+    first — the trip carrying the most shipments (ties broken by record id
+    for determinism). New shipments therefore consolidate onto the real plan
+    instead of scattering onto an empty duplicate, so the legacy tangle
+    cannot grow. Costs one extra read, and only for such appointments."""
     link56 = ctx["wiring"].get("link_on_56")
     ids = lark.link_ids(ex["fields"].get(link56)) if link56 else []
     recent = _recent_trip_get(ex["rec_id"], ctx["wh"].get("plan_table"))
     if recent and recent not in ids:
         ids = [recent] + ids
+    if len(ids) > 1:
+        plan_table = ctx["wh"].get("plan_table")
+        inv_field = ctx["wiring"].get("inv_field")
+        try:
+            got = _batch_get(lark.table_id(plan_table), ids, [inv_field])
+            ids.sort(key=lambda t: (-len(lark.link_ids((got.get(t) or {})
+                                                      .get(inv_field))), t))
+        except lark.LarkError:
+            ids.sort()          # unreadable -> at least stay deterministic
     return ids
 
 
@@ -895,8 +912,8 @@ def _plan_row(ctx, p):
                 # -- move the ROW onto the target's existing 出库计划 --------
                 tgt = tgt_trips[0]
                 if len(tgt_trips) > 1:
-                    W(f"目标预约挂了 {len(tgt_trips)} 个出库计划（应为 1 对 1）— "
-                      f"挂到第一个，请人工清理多余的")
+                    W(f"目标预约挂了 {len(tgt_trips)} 个出库计划（历史遗留，应为 "
+                      f"1 对 1）— 已移挂到货件最多的那个（{tgt}）以便逐步归拢")
                 tgt_inv = lark.link_ids(_batch_get(t5x, [tgt], [inv_field])
                                         .get(tgt, {}).get(inv_field))
                 grp_sum = (ctx["groups"].get(p["isa"]) or {}).get("pallet_sum",
@@ -963,8 +980,8 @@ def _plan_row(ctx, p):
             # -- 4B(i): ISA already has a trip -> link this shipment into it
             trip_id = trips56[0]
             if len(trips56) > 1:
-                W(f"该 ISA 关联了 {len(trips56)} 个出库计划（应为 1 对 1）— "
-                  f"挂靠第一个，请人工清理多余的")
+                W(f"该预约关联了 {len(trips56)} 个出库计划（历史遗留，应为 1 对 1）"
+                  f"— 已挂到货件最多的那个（{trip_id}）以便逐步归拢")
             trip = _batch_get(t5x, [trip_id], [inv_field]).get(trip_id, {})
             trip_inv_ids = lark.link_ids(trip.get(inv_field))
             if rid in trip_inv_ids:

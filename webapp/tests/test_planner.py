@@ -419,6 +419,23 @@ class TestStep4BNoPlan(PlannerCase):
         self.assertEqual(move["trip_id"], "@group")
         self.assertTrue(move.get("replace"))
 
+    def test_legacy_multi_plan_joins_dominant_trip(self):
+        """Legacy duplicates are NOT repaired (operator decision 2026-08-14),
+        but new shipments must consolidate onto the trip carrying the most
+        shipments — never onto an empty duplicate — so the tangle can't grow."""
+        self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56("appt", isa=7403350996,
+                                  trip_links=["tEmpty", "tBusy"])]
+        self.fx.trips["tEmpty"] = make_trip(inv_ids=[], isa_ids=["appt"])
+        self.fx.trips["tBusy"] = make_trip(inv_ids=["x1", "x2", "x3"],
+                                           isa_ids=["appt"])
+        row = self.plan1(LINE_FULL)
+        link = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(link["trip_id"], "tBusy")       # dominant, not first
+        self.assertNotIn("create_trip", self.action_types(row))
+        self.assertTrue(any("历史遗留" in w for w in row["warnings"]),
+                        str(row["warnings"]))
+
     def test_recent_trip_registry_defeats_search_lag(self):
         """A plan created moments ago (previous batch) must be found even
         while the 5.6 search index still shows no link — otherwise a second
