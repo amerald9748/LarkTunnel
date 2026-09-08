@@ -27,3 +27,9 @@ docs/.obsidian/cache
 
 # lark-cli temp payloads
 .tmp/
+
+# Deletion-audit store (local, potentially sensitive)
+logs/
+
+# machine-written operator alias map
+config/operators-auto.json

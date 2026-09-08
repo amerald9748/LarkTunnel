@@ -38,6 +38,7 @@
     <button data-tab="create" class="on">① 新建预约</button>
     <button data-tab="sync">② 计划同步</button>
     <button data-tab="verify">③ 核对</button>
+    <button data-tab="audit">🗑️ 删除日志</button>
     <button data-tab="query">🔍 库存查询</button>
     <button data-tab="upload">📄 文件解析</button>
   </nav>
@@ -209,6 +210,132 @@ ZCSU9034790B&#9;YVR4&#9;1&#9;14&#9;7404870996&#9;08/03/2026 13:00 PDT"></textare
 
       <section id="verifyStatus" class="status" hidden></section>
       <section id="verifyResults" class="results"></section>
+    </section>
+
+    <!-- ═══════════════ 🗑️ 删除日志（只读：本地审计库检索） ═══════════════ -->
+    <section id="tab-audit" class="tabpane" hidden>
+      <section class="panel controls">
+        <div class="stephead"><b>🗑️ 记录变更审计</b>
+          <span class="stepnote">监听器（tools/deletion-watcher）把 记录删除/新增
+            事件连同字段内容存入本地库 — 记录即使已从表中消失，也能按字段值搜到</span></div>
+        <div class="ownnote" id="auditStatusNote">正在读取监听器状态…</div>
+
+        <div class="grid">
+          <label class="fld grow"><span>关键字（柜号 / 批次号 / 路线 / 任意字段值，空格 = 且）</span>
+            <input id="auditQ" type="text" placeholder="例如 BEAU6279991 或 YVR4 2026-LY" autocomplete="off" /></label>
+          <label class="fld"><span>动作</span>
+            <div class="seg" id="auditActSeg">
+              <button data-a="record_deleted" class="on">删除</button>
+              <button data-a="record_added">新增</button>
+              <button data-a="all">全部</button>
+            </div></label>
+          <label class="fld"><span>表</span>
+            <select id="auditTable"><option value="">全部表</option></select></label>
+          <div class="fld go"><span>&nbsp;</span>
+            <button id="auditGoBtn" class="primary">搜索</button></div>
+        </div>
+        <div class="tip">完全只读 — 检索本地审计库，不访问飞书数据表。被删记录的完整字段
+          值在结果行里展开查看。</div>
+
+        <div class="syncgo">
+          <button id="auditHarvestBtn" class="mini">🔄 采集操作人名单</button>
+          <span class="tip" id="auditHarvestTip">扫描各表 创建人/最后修改人（只读）自动建立
+            open_id → 姓名 对照（config/operators-auto.json，无需人工维护）</span>
+        </div>
+
+        <div class="grid">
+          <label class="fld grow"><span>ID 解析（粘贴 opt… / fld… / tbl… / ou_… 得到可读文本）</span>
+            <input id="auditResolveIn" type="text" placeholder="例如 optr3cyl6e" autocomplete="off" /></label>
+          <div class="fld go"><span>&nbsp;</span>
+            <button id="auditResolveBtn" class="mini">解析</button></div>
+        </div>
+        <div class="tip" id="auditResolveOut"></div>
+
+        <div class="stephead mt"><b>条件删除（高级）</b>
+          <span class="stepnote">按条件批量清理本地日志，无需先搜索勾选。JSON 条件，字段：
+            <code>q</code>(关键字) · <code>action</code> · <code>table_id</code> ·
+            <code>record_id</code> · <code>from</code>/<code>to</code>(YYYY-MM-DD [HH:MM])</span></div>
+        <div class="grid">
+          <label class="fld grow"><span>条件 JSON</span>
+            <input id="auditCondIn" type="text" spellcheck="false"
+              placeholder='例如 {"action":"record_edited","to":"2026-09-03"}' autocomplete="off" /></label>
+          <div class="fld go"><span>&nbsp;</span>
+            <button id="auditCondPreviewBtn" class="mini">预览命中</button></div>
+          <div class="fld go"><span>&nbsp;</span>
+            <button id="auditCondDelBtn" class="mini danger" disabled>按条件删除</button></div>
+        </div>
+        <div class="tip" id="auditCondTip">先预览命中数，确认后再删除；空条件会被服务端拒绝。
+          只清理本地日志，不影响飞书数据。</div>
+
+        <details class="helpbox" id="auditHelp">
+          <summary>📖 使用指南与示例（点击展开）</summary>
+          <div class="hb">
+            <span class="sec">🔍 典型调查流程</span>
+            ① 发现异常（某柜某路线的记录不见了）→ ② 在上方关键字框输入线索
+            （柜号 / 批次号 / 路线，<b>空格分隔 = 同时满足</b>，如
+            <code>BEAU6279991 YVR4</code>）→ ③ 点击结果行展开，查看被删记录的
+            <b>全部字段内容</b>、操作人与时间 → ④ 遇到没解析出来的
+            <code>opt…</code> 值，粘到「ID 解析」框回车。
+
+            <span class="sec">🧹 条件删除 — 字段说明</span>
+            条件是一个 JSON 对象，可用键（全部可组合，同时满足才删）：
+            <code>q</code> 关键字（空格=且，等同搜索框）·
+            <code>action</code>（<code>record_deleted</code> /
+            <code>record_added</code> / <code>record_edited</code>）·
+            <code>table_id</code>（tbl 开头，表下拉框里可查）·
+            <code>record_id</code> ·
+            <code>from</code>/<code>to</code>（含当天，
+            <code>YYYY-MM-DD</code> 或 <code>YYYY-MM-DD HH:MM</code>）
+
+            <span class="sec">⚡ 示例（点「填入」即可开始）</span>
+            <div class="ex"><code>{"action":"record_edited"}</code>
+              <span class="exnote">清掉旧策略时期的全部编辑事件</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"action":"record_edited"}'>填入</button></div>
+            <div class="ex"><code>{"to":"2026-08-31"}</code>
+              <span class="exnote">删除 8 月底（含）之前的所有日志</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"to":"2026-08-31"}'>填入</button></div>
+            <div class="ex"><code>{"to":"…30 天前…"}</code>
+              <span class="exnote">只保留最近 30 天（日期自动计算）</span>
+              <button class="mini exfill" type="button" data-dyn="keep30">填入</button></div>
+            <div class="ex"><code>{"q":"BEAU6279991"}</code>
+              <span class="exnote">清掉某个柜号的全部日志</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"q":"BEAU6279991"}'>填入</button></div>
+            <div class="ex"><code>{"action":"record_added","table_id":"tblbJiIHMwND2OGX","from":"2026-09-01","to":"2026-09-03"}</code>
+              <span class="exnote">3.1 表某日期段的新增事件</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"action":"record_added","table_id":"tblbJiIHMwND2OGX","from":"2026-09-01","to":"2026-09-03"}'>填入</button></div>
+            <div class="ex"><code>{"q":"yvr4 2026-LY","action":"record_deleted"}</code>
+              <span class="exnote">关键字组合 + 只删删除事件</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"q":"yvr4 2026-LY","action":"record_deleted"}'>填入</button></div>
+
+            <div class="hbnote">流程恒定：<b>填条件 → 预览命中 → 按条件删除</b>
+              （改动条件后必须重新预览才能删）。只动本地 logs/audit.db，绝不碰
+              飞书表格；删完自动 VACUUM 释放磁盘。空条件 = 全库删除，会被拒绝 —
+              真要清空就用 <code>{"from":"2000-01-01"}</code> 明确表达。</div>
+
+            <span class="sec">🔤 ID 解析框</span>
+            支持四种前缀：<code>opt…</code> 单选/多选选项值（跨表检索，标注
+            来源表·字段）· <code>fld…</code> 字段 id · <code>tbl…</code> 表 id ·
+            <code>ou_…</code> 操作人。服务启动后台预热索引，冷启动最初 1-2 分钟
+            首次解析会等待；跨 Base 公式带出的 opt 值无法解析。操作人识别不到时
+            先点「🔄 采集操作人名单」再试。
+          </div>
+        </details>
+      </section>
+
+      <section id="auditStatus" class="status" hidden></section>
+      <section id="auditResults" class="results"></section>
+
+      <div class="execbar" id="auditDelBar" hidden>
+        <label class="chkall"><input type="checkbox" id="chkAllAud" /> 全选命中日志</label>
+        <button id="auditDelBtn" class="primary danger" disabled>删除选中日志</button>
+        <span class="tip">只清理<b>本地审计库</b>，不影响飞书表格数据；删除后自动
+          VACUUM 释放磁盘空间。不可恢复。</span>
+      </div>
     </section>
 
     <!-- ═══════════════ 库存查询（原查询台） ═══════════════ -->

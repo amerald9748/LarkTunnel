@@ -311,6 +311,27 @@ def list_views(table_id):
     return _cached(f"views:{table_id}", produce)
 
 
+def list_tables():
+    """{table_id: table_name} for EVERY table in the Base (5-min cached).
+    Lets read-time views label tables that aren't in the config registry."""
+    def produce():
+        base = config_values()["base_token"]
+        out, pt = {}, None
+        while True:
+            q = {"page_size": 100}
+            if pt:
+                q["page_token"] = pt
+            data = _api("GET", f"/open-apis/bitable/v1/apps/{base}/tables", query=q)
+            for t in data.get("items", []):
+                if t.get("table_id"):
+                    out[t["table_id"]] = t.get("name") or t["table_id"]
+            if not data.get("has_more"):
+                break
+            pt = data.get("page_token")
+        return out
+    return _cached("tables:names", produce)
+
+
 def get_view(table_id, view_id):
     def produce():
         base = config_values()["base_token"]

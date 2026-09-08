@@ -24,6 +24,9 @@ import appointment_sync
 import appointment_create
 import inventory_import
 import verify_assignments
+import audit_store
+import audit_view
+import identity_harvest
 import sync_jobs
 
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024  # 30 MB of request body
@@ -144,6 +147,14 @@ class Handler(BaseHTTPRequestHandler):
                     "dest_options": dests,
                     "thresholds": {"pallet_diff": appointment_sync.PALLET_DIFF_WARN,
                                    "trip_cap": appointment_sync.TRIP_PALLET_CAP}})
+            if route == "/api/audit/status":
+                # 🗑️ 删除日志 status bar — local SQLite only, no Feishu I/O
+                st = audit_store.status()
+                labels = audit_view._table_labels()
+                for row in st.get("per_table", []):
+                    row["label"] = labels.get(row.get("table_id"), row.get("table_id"))
+                return self._send_json({"ok": True, "status": st,
+                                        "env": lark.env(), "tz": lark.tz_label()})
             if route == "/api/views":
                 table_id = (qs.get("table") or [None])[0]
                 if not table_id:
@@ -307,6 +318,102 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
         return self._send_json({"ok": True, "job": job})
 
+    # ---- 🗑️ 删除日志 search（local SQLite; field-name/operator enrichment
+    #      reads Feishu metadata but never writes anything） -------------------
+    def _handle_audit_search(self, payload):
+        rows = audit_store.search(
+            q=payload.get("q"),
+            action=payload.get("action"),
+            table_id=payload.get("table_id") or None,
+            ts_from=payload.get("from") or None,
+            ts_to=payload.get("to") or None,
+            record_id=payload.get("record_id") or None,
+            limit=payload.get("limit") or 200,
+        )
+        try:
+            rows = audit_view.enrich(rows)
+        except Exception as e:  # enrichment is best-effort — raw rows still ship
+            for r in rows:
+                r.setdefault("table_label", r.get("table_id"))
+                r.setdefault("operator_name", r.get("operator_open_id"))
+                r.setdefault("before", [])
+                r.setdefault("after", [])
+                r.pop("raw", None)
+            return self._send_json({"ok": True, "rows": rows,
+                                    "enrich_error": str(e), "tz": lark.tz_label()})
+        return self._send_json({"ok": True, "rows": rows, "tz": lark.tz_label()})
+
+    # ---- 🗑️ operator-identity harvest（read-only Lark sweeps → local json）--
+    def _handle_audit_harvest(self, payload):
+        def run(progress):
+            return identity_harvest.harvest(progress=progress)
+        try:
+            job = sync_jobs.start("plan", run)   # 'plan' kind = read-only
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
+        return self._send_json({"ok": True, "job": job})
+
+    # ---- 🗑️ audit-log pruning — deletes LOCAL log rows only, never Lark ----
+    @staticmethod
+    def _audit_filters(cond):
+        """Condition JSON -> audit_store filter kwargs. Dates accept epoch or
+        'YYYY-MM-DD[ HH:MM]' strings (interpreted in the display timezone)."""
+        import datetime
+
+        def ts_of(v, end=False):
+            if v in (None, ""):
+                return None
+            if isinstance(v, (int, float)):
+                return int(v)
+            s = str(v).strip()
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+                        "%Y/%m/%d %H:%M", "%Y/%m/%d"):
+                try:
+                    dt = datetime.datetime.strptime(s, fmt)
+                    if fmt in ("%Y-%m-%d", "%Y/%m/%d") and end:
+                        dt = dt.replace(hour=23, minute=59, second=59)
+                    return int(dt.replace(tzinfo=lark.TZ).timestamp())
+                except ValueError:
+                    continue
+            raise ValueError(f"无法解析时间「{s}」— 用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM")
+
+        return {
+            "q": cond.get("q") or None,
+            "action": cond.get("action") or None,
+            "table_id": cond.get("table_id") or cond.get("table") or None,
+            "record_id": cond.get("record_id") or None,
+            "ts_from": ts_of(cond.get("from") or cond.get("after")),
+            "ts_to": ts_of(cond.get("to") or cond.get("before"), end=True),
+        }
+
+    def _handle_audit_delete(self, payload):
+        try:
+            if payload.get("where") is not None:
+                # condition-based bulk mode (power user): dry_run counts only
+                filters = self._audit_filters(payload["where"] or {})
+                if payload.get("dry_run"):
+                    n = audit_store.count_where(**filters)
+                    return self._send_json({"ok": True, "dry_run": True, "count": n})
+                n = audit_store.delete_where(**filters)
+                return self._send_json({"ok": True, "deleted": n,
+                                        "status": audit_store.status()})
+            ids = payload.get("ids") or []
+            if not isinstance(ids, list) or not ids:
+                return self._send_json({"ok": False, "error": "没有选中要删除的日志"}, 200)
+            n = audit_store.delete_events(ids)
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"删除失败: {e}"}, 200)
+        return self._send_json({"ok": True, "deleted": n,
+                                "status": audit_store.status()})
+
+    # ---- 🗑️ ad-hoc id resolver（opt/fld/tbl/ou → readable text; read-only）--
+    def _handle_audit_resolve(self, payload):
+        try:
+            res = audit_view.resolve_token(payload.get("token") or "")
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"解析失败: {e}"}, 200)
+        return self._send_json({"ok": True, "result": res})
+
     # ---- ③核对 (READ-ONLY audit of the finished assignments) ---------------
     def _handle_verify(self, payload):
         warehouse = payload.get("warehouse") or ""
@@ -329,6 +436,8 @@ class Handler(BaseHTTPRequestHandler):
                                "/api/sync/plan", "/api/sync/commit",
                                "/api/create56/plan", "/api/create56/commit",
                                "/api/import/plan", "/api/import/commit",
+                               "/api/audit/search", "/api/audit/delete",
+                               "/api/audit/harvest", "/api/audit/resolve",
                                "/api/verify"):
             return self.send_error(404, "Not found")
         try:
@@ -353,6 +462,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_import_plan(payload)
         if parsed.path == "/api/import/commit":
             return self._handle_import_commit(payload)
+        if parsed.path == "/api/audit/search":
+            return self._handle_audit_search(payload)
+        if parsed.path == "/api/audit/delete":
+            return self._handle_audit_delete(payload)
+        if parsed.path == "/api/audit/harvest":
+            return self._handle_audit_harvest(payload)
+        if parsed.path == "/api/audit/resolve":
+            return self._handle_audit_resolve(payload)
         if parsed.path == "/api/verify":
             return self._handle_verify(payload)
 
@@ -422,6 +539,12 @@ def main():
             print(f"[LarkTunnel] DEV MODE — 3.1/5.6 resolve to {cfg['dev_tables']}")
     except lark.LarkError as e:
         print(f"[LarkTunnel] CONFIG ERROR: {e}")
+    # Pre-warm the cross-table id index (opt/fld resolver) in the background —
+    # cold build is 1-2 min of metadata calls; warmed, 解析 answers instantly.
+    try:
+        audit_view.warm_indexes_async()
+    except Exception as e:  # noqa
+        print(f"[LarkTunnel] index warm-up not started: {e}")
     try:
         httpd = _Server(("127.0.0.1", PORT), Handler)
     except OSError as e:

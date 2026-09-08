@@ -8,6 +8,7 @@
 | ① **新建预约** | 粘贴预约明细 → 创建 5.6 里缺失的 ISA | 仅在勾选+二次确认后 |
 | ② **计划同步** | 粘贴到仓明细 → 逐行核对 3.1 / 5.6 / 出库计划 → **人工勾选后**批量执行 | 仅在点击「执行」并二次确认后 |
 | ③ **核对** | 沿 3.1 → 出库计划 → 5.6 只读审计 | 只读 |
+| 🗑️ **删除日志** | 检索本地审计库（deletion-watcher 收录的 记录删除/编辑 事件，含被删内容） | 只读（本地 SQLite） |
 | 🔍 **库存查询** | 柜号 / ISA → 3.1 实时查询，可按视图筛选 | 只读 |
 | 📄 **文件解析** | Excel/CSV 自动识别，结果一键送 ①/② | 只读 |
 
@@ -420,5 +421,24 @@ xlsx 读取优先用 `openpyxl`（能正确处理日期单元格），没装则�
 | POST | `/api/parse` | `{filename, content_b64, table?}` → 六字段识别结果（缺失为 `null`）|
 | POST | `/api/import/plan` | `{filename, content_b64, awb, batch, warehouse}` → job（只读预检）|
 | POST | `/api/import/commit` | 同上 + `{approvals:[{dest,sig}], env}` → job（写 3.1 + 回读核实）|
+| GET | `/api/audit/status` | 🗑️ 审计库统计 + 监听器心跳（本地 SQLite，不访问飞书）|
+| POST | `/api/audit/search` | `{q, action, table_id?, record_id?, from?, to?, limit?}` → 变更事件（被删记录按字段值可搜；读时解析 字段名/操作人）|
+
+> 🗑️ 数据来源：`tools/deletion-watcher/watcher.py`（长连接监听
+> `drive.file.bitable_record_changed_v1` → `logs/audit.db`）。激活清单与注意
+> 事项见 `docs/60 Safety/Deletion Tracking.md`。收录 新增+删除（全表；编辑不
+> 收录，`TRACKED_ACTIONS` 可改）。页签内可勾选删除本地日志（自动 VACUUM）。
+>
+> **操作人显示名**：`config/operators-auto.json`（🔄 采集按钮 /
+> `identity_harvest.py` 扫描各表 创建人/修改人 自动生成，免维护）→ 通讯录 API
+> （需 `contact:contact.base:readonly` 且用户在应用通讯录范围内；失败 10 分钟
+> 后自动重试）→ 原样 open_id。（手工 operators.json 层已按操作者要求移除。）
+> 表名显示：live 表清单自动解析，config 注册表标签优先。
+>
+> **页签内工具**：ID 解析框（粘贴 opt/fld/tbl/ou_ id → 可读文本；跨表索引
+> 服务启动时后台预热，冷启动首次解析约 2 分钟，之后即时、6 小时缓存）；
+> **条件删除（高级）**：JSON 条件（q/action/table_id/record_id/from/to）→
+> 预览命中数 → 确认删除，免搜索免勾选，空条件被拒绝；结果表 record_id 列已
+> 换成 柜号/AWB（无柜号字段的表回退显示 record_id，详情行仍含 record_id）。
 
 `/api/query` 返回：`{ok, count, total_found, view_filter:{excluded,unsupported,...}, matched, rows}`。

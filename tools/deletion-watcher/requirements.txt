@@ -1,0 +1,2 @@
+# Only the watcher needs this — the webapp stays zero-dependency.
+lark-oapi>=1.7.3

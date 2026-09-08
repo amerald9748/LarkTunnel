@@ -332,3 +332,17 @@ tr.detail > td{background-color:var(--soft); padding:0}
   .tabs{padding:0 10px}
   .tabs button{padding:0 12px; font-size:12px}
 }
+
+/* ---- 🗑️ in-tab usage guide (collapsible) ---- */
+.helpbox{margin-top:14px; border:1px solid var(--line); border-radius:9px; background-color:var(--chip)}
+.helpbox summary{cursor:pointer; padding:9px 12px; font-weight:600; font-size:13px; color:var(--muted); user-select:none}
+.helpbox summary:hover{color:var(--ink)}
+.helpbox[open] summary{border-bottom:1px solid var(--line); color:var(--ink)}
+.helpbox .hb{padding:10px 14px 12px; font-size:12.5px; line-height:1.8; color:var(--ink)}
+.helpbox .hb .sec{display:block; margin-top:10px; font-weight:700}
+.helpbox .hb .sec:first-child{margin-top:0}
+.helpbox code{background-color:var(--panel); border:1px solid var(--line); border-radius:4px; padding:1px 5px; font-size:12px; font-family:ui-monospace,Consolas,monospace}
+.helpbox .ex{display:flex; gap:8px; align-items:center; margin:5px 0}
+.helpbox .ex code{flex:1 1 auto; overflow-x:auto; white-space:nowrap}
+.helpbox .ex .exnote{flex:0 0 auto; color:var(--muted); font-size:12px}
+.helpbox .hbnote{color:var(--muted); font-size:12px; margin-top:6px}

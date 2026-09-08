@@ -37,6 +37,8 @@ up ISA appointments ↔ delivery trips ↔ inventory rows.
 - [[Warehouse & Account Map]] — warehouse → account → plan table → link fields.
 - [[Wrapper Library]] — the JS API you call.
 - [[Lark CLI Cheatsheet]] — raw commands behind the wrappers.
+- [[Deletion Tracking]] — 3.1 records going missing: forensics (操作历史),
+  event-based deletion logger design, snapshot fallback, prevention.
 
 ## For agents
 

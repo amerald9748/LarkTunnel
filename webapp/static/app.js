@@ -739,6 +739,9 @@ async function bootSync() {
   // ---- 📦 库存导入 tab wiring ----
   wireImportTab();
 
+  // ---- 🗑️ 删除日志 tab wiring ----
+  initAudit();
+
   reattachJob();   // resume a job that was running when the page reloaded
 }
 
@@ -1574,6 +1577,343 @@ async function execCreate56() {
     setCreateStatus([el("span", {}, "⚠ 执行失败：" + e.message)], true);
   }
   create56.busy = false; updateCreateExec(); gateCreatePlan();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   🗑️ 删除日志 — read-only search over the local audit store fed by
+   tools/deletion-watcher (drive.file.bitable_record_changed_v1 events).
+   Deleted records stay searchable by field-value clues via before_value.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const auditState = { action: "record_deleted", busy: false };
+
+const AUDIT_ACT_LABEL = {
+  record_deleted: ["bad", "删除"],
+  record_edited: ["warn", "编辑"],
+  record_added: ["ok", "新增"],
+  parse_error: ["neu", "解析失败"],
+};
+// Summary preference for the collapsed row (before_value field names).
+// 柜号/AWB is NOT here — it has its own column (replaces record_id).
+const AUDIT_KEY_FIELDS = ["目的地路线", "仓库供应商", "客户批次号",
+  "箱数", "实际板数", "客户自单号"];
+
+// The 柜号/AWB (or closest equivalent) of a logged row, for the AWB column.
+function auditAwbOf(r) {
+  const fields = [...(r.before || []), ...(r.after || [])];
+  for (const f of fields) {
+    const n = (f.name || "").toUpperCase();
+    if ((n.includes("柜号") || n.includes("AWB")) && f.value) return f.value;
+  }
+  return null;
+}
+
+function fmtEpoch(ts) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false });
+}
+
+function initAudit() {
+  $("#auditActSeg").addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    auditState.action = b.dataset.a;
+    [...$("#auditActSeg").children].forEach((x) => x.classList.toggle("on", x === b));
+  });
+  $("#auditGoBtn").addEventListener("click", runAuditSearch);
+  $("#auditQ").addEventListener("keydown", (e) => { if (e.key === "Enter") runAuditSearch(); });
+  $("#chkAllAud").addEventListener("change", (e) => {
+    document.querySelectorAll("#auditResults input.rowchkaud")
+      .forEach((c) => { c.checked = e.target.checked; });
+    updateAuditDel();
+  });
+  $("#auditDelBtn").addEventListener("click", deleteAuditRows);
+  $("#auditHarvestBtn").addEventListener("click", runHarvest);
+  $("#auditResolveBtn").addEventListener("click", resolveToken);
+  $("#auditResolveIn").addEventListener("keydown", (e) => { if (e.key === "Enter") resolveToken(); });
+  $("#auditCondPreviewBtn").addEventListener("click", () => condDelete(true));
+  $("#auditCondDelBtn").addEventListener("click", () => condDelete(false));
+  // editing the condition disarms the delete button until re-previewed
+  $("#auditCondIn").addEventListener("input", () => {
+    $("#auditCondDelBtn").disabled = true;
+    audCond.count = null;
+  });
+  // guide examples: 「填入」 buttons drop their JSON into the condition input
+  $("#auditHelp").addEventListener("click", (e) => {
+    const b = e.target.closest("button.exfill"); if (!b) return;
+    e.preventDefault();
+    let cond = b.dataset.cond;
+    if (b.dataset.dyn === "keep30") {           // keep last 30 days
+      const d = new Date(Date.now() - 30 * 864e5);
+      const pad = (n) => String(n).padStart(2, "0");
+      cond = JSON.stringify({ to: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` });
+    }
+    $("#auditCondIn").value = cond;
+    $("#auditCondDelBtn").disabled = true;
+    audCond.count = null;
+    $("#auditCondTip").textContent = "已填入示例 — 点「预览命中」查看会删多少条";
+    $("#auditCondIn").focus();
+  });
+  loadAuditStatus();
+}
+
+async function resolveToken() {
+  const t = $("#auditResolveIn").value.trim();
+  const out = $("#auditResolveOut");
+  if (!t) { out.textContent = ""; return; }
+  out.textContent = "解析中…（首次会扫描全部表的字段元数据）";
+  try {
+    const r = await fetch("/api/audit/resolve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: t }),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "解析失败");
+    const res = r.result;
+    out.textContent = res.name
+      ? `✅ ${res.kind}：${t} = ${res.name}${res.context ? `（${res.context}）` : ""}`
+      : `❌ ${res.kind}：${t} — ${res.context || "未找到"}`;
+    clog("删除日志", "解析", t, "->", res.name || res.context);
+  } catch (e) {
+    out.textContent = "⚠ " + e.message;
+  }
+}
+
+// ---- condition-based bulk deletion (power user; local store only) ----
+const audCond = { count: null };
+
+function parseCond() {
+  const raw = $("#auditCondIn").value.trim();
+  if (!raw) throw new Error("请输入条件 JSON");
+  let cond;
+  try { cond = JSON.parse(raw); } catch (e) { throw new Error("JSON 无法解析：" + e.message); }
+  if (typeof cond !== "object" || Array.isArray(cond)) throw new Error("条件必须是 JSON 对象");
+  return cond;
+}
+
+async function condDelete(dryRun) {
+  const tip = $("#auditCondTip");
+  let cond;
+  try { cond = parseCond(); } catch (e) { tip.textContent = "⚠ " + e.message; return; }
+  if (!dryRun) {
+    if (audCond.count === null) { tip.textContent = "⚠ 请先预览命中数"; return; }
+    if (!confirm(`按条件从本地审计库删除 ${audCond.count} 条日志？\n\n条件：`
+      + `${JSON.stringify(cond)}\n\n只影响本机 logs/audit.db，不影响飞书数据。不可恢复。`))
+      return;
+  }
+  try {
+    const r = await fetch("/api/audit/delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ where: cond, dry_run: dryRun }),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "失败");
+    if (dryRun) {
+      audCond.count = r.count;
+      $("#auditCondDelBtn").disabled = r.count === 0;
+      tip.textContent = `预览：命中 ${r.count} 条 — ${r.count ? "确认后点「按条件删除」" : "无可删"}`;
+    } else {
+      tip.textContent = `✅ 已删除 ${r.deleted} 条（已 VACUUM 释放空间）`;
+      audCond.count = null;
+      $("#auditCondDelBtn").disabled = true;
+      clog("删除日志", `条件删除 ${r.deleted} 条`, cond);
+      await loadAuditStatus();
+    }
+  } catch (e) {
+    tip.textContent = "⚠ " + e.message;
+  }
+}
+
+async function runHarvest() {
+  const btn = $("#auditHarvestBtn");
+  btn.disabled = true; btn.textContent = "采集中…";
+  showProgress("plan");
+  clog("删除日志", "开始采集操作人名单（只读扫描）");
+  try {
+    const r = await fetch("/api/audit/harvest", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "采集失败");
+    const job = await pollJob(r.job.id, "plan");
+    hideProgress();
+    const s = job.result;
+    $("#auditHarvestTip").textContent =
+      `✅ 扫描 ${s.tables_scanned} 张表 · 识别 ${s.found} 人 · 新增/更新 ${s.new_or_changed} · 共 ${s.total_known} 条对照`;
+    clog("删除日志", "采集完成", s);
+    if (s.sample_new && Object.keys(s.sample_new).length)
+      console.table(s.sample_new);
+  } catch (e) {
+    hideProgress();
+    cerr("删除日志", "采集失败:", e.message);
+    $("#auditHarvestTip").textContent = "⚠ " + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = "🔄 采集操作人名单";
+  }
+}
+
+function updateAuditDel() {
+  const n = document.querySelectorAll("#auditResults input.rowchkaud:checked").length;
+  $("#auditDelBtn").textContent = `删除选中日志（${n} 条）`;
+  $("#auditDelBtn").disabled = n === 0;
+}
+
+async function deleteAuditRows() {
+  const ids = [...document.querySelectorAll("#auditResults input.rowchkaud:checked")]
+    .map((c) => Number(c.dataset.id));
+  if (!ids.length) return;
+  if (!confirm(`从本地审计库删除 ${ids.length} 条日志？\n\n只影响本机 logs/audit.db，`
+    + `不影响飞书表格数据。删除后不可恢复（被删记录的内容随日志一起消失）。`))
+    return;
+  const btn = $("#auditDelBtn");
+  btn.disabled = true; btn.textContent = "删除中…";
+  try {
+    const r = await fetch("/api/audit/delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "删除失败");
+    clog("删除日志", `已清理 ${r.deleted} 条本地日志`);
+    $("#chkAllAud").checked = false;
+    await loadAuditStatus();
+    await runAuditSearch();          // re-render remaining rows
+  } catch (e) {
+    cerr("删除日志", "清理失败:", e.message);
+    setAuditStatus([el("span", {}, "⚠ " + e.message)], true);
+    btn.disabled = false; updateAuditDel();
+  }
+}
+
+async function loadAuditStatus() {
+  const note = $("#auditStatusNote");
+  try {
+    const r = await fetch("/api/audit/status").then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "状态读取失败");
+    const s = r.status;
+    const alive = s.watcher_alive;
+    const bits = [];
+    bits.push(alive ? "🟢 监听器在线" : "🔴 监听器离线（离线期间的删除不会入库）");
+    bits.push(`已存事件 ${s.total}（删除 ${s.deleted}）`);
+    if (s.earliest) bits.push(`覆盖 ${fmtEpoch(s.earliest)} ~ ${fmtEpoch(s.latest)}`);
+    const gb = (s.db_bytes || 0) / 1024 ** 3;
+    bits.push(`日志体积 ${gb >= 1 ? gb.toFixed(2) + " GB" : ((s.db_bytes || 0) / 1048576).toFixed(1) + " MB"}`);
+    if (s.db_over_limit)
+      bits.push(`‼ 日志已超 ${(s.db_max_bytes / 1024 ** 3).toFixed(1)} GB 上限 — 请归档/清理 logs/audit.db`);
+    if (!s.subscribed) bits.push("⚠ 尚未订阅 Base 事件 — 见 docs/60 Safety/Deletion Tracking.md 激活清单");
+    note.textContent = bits.join(" · ");
+    if (s.db_over_limit) cerr("删除日志", `审计库超过上限：${gb.toFixed(2)} GB`);
+    const sel = $("#auditTable");
+    const seen = new Set([""]);
+    for (const t of s.per_table || []) {
+      if (seen.has(t.table_id)) continue;
+      seen.add(t.table_id);
+      sel.append(el("option", { value: t.table_id }, t.label || t.table_id));
+    }
+    clog("删除日志", "状态", s);
+  } catch (e) {
+    note.textContent = "⚠ " + e.message;
+  }
+}
+
+function setAuditStatus(nodes, isErr) {
+  const s = $("#auditStatus");
+  s.hidden = false; s.className = "status" + (isErr ? " err" : "");
+  s.innerHTML = ""; nodes.forEach((n) => s.append(n));
+}
+
+async function runAuditSearch() {
+  const btn = $("#auditGoBtn");
+  auditState.busy = true; btn.disabled = true; btn.textContent = "搜索中…";
+  $("#auditResults").innerHTML = "";
+  try {
+    const r = await fetch("/api/audit/search", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        q: $("#auditQ").value.trim(),
+        action: auditState.action,
+        table_id: $("#auditTable").value || null,
+        limit: 300,
+      }),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "搜索失败");
+    renderAudit(r.rows || []);
+    clog("删除日志", "搜索完成", `命中 ${r.rows.length} 条`);
+  } catch (e) {
+    cerr("删除日志", "失败:", e.message);
+    setAuditStatus([el("span", {}, "⚠ " + e.message)], true);
+  } finally {
+    auditState.busy = false; btn.disabled = false; btn.textContent = "搜索";
+  }
+}
+
+function renderAudit(rows) {
+  setAuditStatus([
+    el("span", { class: "pill" }, "命中 ", el("b", {}, String(rows.length)), " 条"),
+    el("span", { class: "pill" }, "动作 " + (auditState.action === "all" ? "全部"
+      : (AUDIT_ACT_LABEL[auditState.action] || [])[1] || auditState.action)),
+    el("span", { class: "pill" }, "本地审计库 · 只读"),
+  ], false);
+
+  const mount = $("#auditResults");
+  mount.innerHTML = "";
+  $("#auditDelBar").hidden = rows.length === 0;
+  $("#chkAllAud").checked = false;
+  if (!rows.length) {
+    mount.append(el("div", { class: "empty" },
+      "没有命中。注意：只有监听器运行期间发生的操作才在库里 — 订阅之前的历史删除请用 Base 的「历史记录」。"));
+    return;
+  }
+  const cols = ["", "时间", "动作", "表", "操作人", "柜号/AWB", "关键字段"];
+  const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c))));
+  const tbody = el("tbody");
+
+  for (const r of rows) {
+    const [cls, label] = AUDIT_ACT_LABEL[r.action] || ["neu", r.action];
+    const chk = el("input", { type: "checkbox", class: "rowchkaud", "data-id": r.id });
+    chk.addEventListener("change", updateAuditDel);
+    chk.addEventListener("click", (e) => e.stopPropagation());
+    const fields = (r.action === "record_added" ? r.after : r.before) || [];
+    const byName = {};
+    for (const f of fields) byName[f.name] = f.value;
+    const keyBits = AUDIT_KEY_FIELDS.filter((k) => byName[k] !== undefined && byName[k] !== "")
+      .map((k) => `${k}=${byName[k]}`);
+    const summary = keyBits.length ? keyBits.join(" · ")
+      : fields.slice(0, 4).map((f) => `${f.name}=${f.value}`).join(" · ") || "—";
+
+    const awb = auditAwbOf(r);
+    const tr = el("tr", { class: r.action === "record_deleted" ? "rowbad" : "" },
+      el("td", {}, chk),
+      el("td", {}, fmtEpoch(r.ts)),
+      el("td", {}, el("span", { class: "chip " + cls }, label)),
+      el("td", {}, r.table_label || r.table_id),
+      el("td", {}, r.operator_name || r.operator_open_id || "—"),
+      el("td", {}, awb ? el("b", {}, awb) : el("span", { class: "sub" }, r.record_id || "—")),
+      el("td", { class: "wcol" }, clip(summary)));
+
+    const detailFields = [];
+    if (r.before && r.before.length) {
+      detailFields.push(el("div", { class: "rid" }, `删除/修改前字段（${r.before.length}）`));
+      detailFields.push(el("div", { class: "dl" }, ...r.before.map((f) =>
+        el("div", { class: "item" }, el("span", { class: "n" }, f.name),
+          el("span", { class: "v" }, f.value || "—")))));
+    }
+    if (r.after && r.after.length) {
+      detailFields.push(el("div", { class: "rid" }, `修改后字段（${r.after.length}）`));
+      detailFields.push(el("div", { class: "dl" }, ...r.after.map((f) =>
+        el("div", { class: "item" }, el("span", { class: "n" }, f.name),
+          el("span", { class: "v" }, f.value || "—")))));
+    }
+    const detail = el("tr", { class: "detail", hidden: "" },
+      el("td", { colspan: String(cols.length) },
+        el("div", { class: "detail-inner" },
+          el("div", { class: "rid" },
+            `record ${r.record_id || "?"} · event ${r.event_id || "?"} · `
+            + `revision ${r.revision || "?"} · 入库 ${fmtEpoch(r.received_at)}`),
+          ...detailFields)));
+    tr.addEventListener("click", () => {
+      const open = !detail.hasAttribute("hidden");
+      if (open) { detail.setAttribute("hidden", ""); tr.classList.remove("open"); }
+      else { detail.removeAttribute("hidden"); tr.classList.add("open"); }
+    });
+    tbody.append(tr, detail);
+  }
+  mount.append(el("div", { class: "tablewrap" }, el("table", { class: "synctable" }, thead, tbody)));
+  updateAuditDel();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
