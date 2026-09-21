@@ -16,6 +16,7 @@
     } catch (e) { document.documentElement.dataset.theme = "light"; }
   </script>
   <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" type="image/png" href="/static/larktunnel.png" />
 </head>
 <body>
   <header class="topbar">
@@ -24,6 +25,8 @@
     </div>
     <div class="topright">
       <span class="hint"><span id="tzNote">—</span></span>
+      <!-- connection + operator at a glance; click -> ⚙ 设置 -->
+      <button id="whoChip" class="whochip" type="button" title="连接与授权状态 — 点击打开设置" hidden></button>
       <button id="themeBtn" class="themebtn" type="button"
               title="切换主题：自动 / 浅色 / 深色">🌗 自动</button>
     </div>
@@ -41,7 +44,20 @@
     <button data-tab="audit">🗑️ 删除日志</button>
     <button data-tab="query">🔍 库存查询</button>
     <button data-tab="upload">📄 文件解析</button>
+    <button data-tab="settings" class="tabright">⚙ 设置</button>
   </nav>
+
+  <!-- LOCK: team mode + this person's 授权 is off/missing. Covers the work
+       tabs; ⚙ 设置 stays reachable so a new 授权码 / credentials can be
+       entered. The server refuses every Feishu route meanwhile anyway. -->
+  <div id="lockOverlay" class="lockoverlay" hidden>
+    <div class="lockcard">
+      <div class="lockicon">🔒</div>
+      <b>工具已锁定</b>
+      <div id="lockReason" class="lockreason">—</div>
+      <button id="lockSettingsBtn" class="primary" type="button">打开 ⚙ 设置</button>
+    </div>
+  </div>
 
   <main class="wrap">
     <!-- shared job progress — visible from ANY tab while plan/commit runs -->
@@ -410,6 +426,98 @@ ZCSU9034790B&#9;YVR4&#9;1&#9;14&#9;7404870996&#9;08/03/2026 13:00 PDT"></textare
           </div>
         </div>
         <div id="parseOut" class="parseout" hidden></div>
+      </section>
+    </section>
+
+    <!-- ═══════════════ ⚙ 设置（凭据 · 操作人 · 团队授权 · 运行） ═══════════════ -->
+    <section id="tab-settings" class="tabpane" hidden>
+
+      <section class="panel controls settings" id="credPanel">
+        <div class="stephead"><b>🔐 飞书应用凭据</b>
+          <span class="stepnote">App ID / App Secret 用 Windows DPAPI 加密保存在<b>本机当前账户</b>下——
+            复制文件夹到别的电脑无法解密；密钥从不发送到浏览器或写入日志。</span></div>
+        <div id="credStatus" class="tip"></div>
+        <div class="grid">
+          <label class="fld"><span>App ID</span>
+            <input type="text" id="setAppId" placeholder="cli_…" autocomplete="off" spellcheck="false" /></label>
+          <label class="fld grow"><span>App Secret <em>（仅在保存/切换时填写）</em></span>
+            <input type="password" id="setAppSecret" placeholder="••••••••" autocomplete="new-password" /></label>
+          <div class="fld go"><span>&nbsp;</span><button id="credTestBtn" class="primary ghost" type="button">测试连接</button></div>
+          <div class="fld go"><span>&nbsp;</span><button id="credSaveBtn" class="primary" type="button">验证并保存</button></div>
+          <div class="fld go"><span>&nbsp;</span><button id="credClearBtn" class="primary danger" type="button">清除本机凭据</button></div>
+        </div>
+        <div id="credResult" class="tip"></div>
+        <div class="ownnote">切换凭据：飞书开放平台重置 App Secret 后，在这里填新密钥「验证并保存」即可，
+          无需重启；旧密钥在所有电脑上立即失效。</div>
+      </section>
+
+      <section class="panel controls settings">
+        <div class="stephead"><b>👤 操作人</b>
+          <span class="stepnote">显示在右上角，并写入本机执行记录（logs/ops.jsonl）——飞书只记录应用名，
+            这里才能看出是谁执行了哪一批。</span></div>
+        <div class="grid">
+          <label class="fld grow"><span>姓名</span>
+            <input type="text" id="setOperator" placeholder="例如 张三" /></label>
+          <div class="fld go"><span>&nbsp;</span><button id="operatorSaveBtn" class="primary" type="button">保存</button></div>
+        </div>
+      </section>
+
+      <section class="panel controls settings" id="accessPanel">
+        <div class="stephead"><b>🛡️ 团队授权</b>
+          <span class="stepnote">成员各自持有一枚授权码；管理员在飞书授权表里把某人切为「停用」，
+            其工具最多 5 分钟后锁定，服务端同时拒绝一切读写。</span></div>
+        <div id="accessMode" class="tip"></div>
+        <div class="grid">
+          <label class="fld grow"><span>我的授权码 <em id="accessKeyHint"></em></span>
+            <input type="password" id="setAccessKey" placeholder="LT-…（由管理员签发）" autocomplete="off" /></label>
+          <div class="fld go"><span>&nbsp;</span><button id="accessKeySaveBtn" class="primary" type="button">保存并验证</button></div>
+          <div class="fld go"><span>&nbsp;</span><button id="accessCheckBtn" class="primary ghost" type="button">重新验证</button></div>
+        </div>
+        <div id="accessResult" class="tip"></div>
+
+        <details class="helpbox" id="ownerBox">
+          <summary>管理员：授权表与成员管理</summary>
+          <div class="hb">
+            <div class="grid">
+              <label class="fld grow"><span>授权表 ID <em>（留空 = 单机模式，不校验）</em></span>
+                <input type="text" id="setAuthTable" placeholder="tbl…" spellcheck="false" /></label>
+              <div class="fld go"><span>&nbsp;</span><button id="authTableSaveBtn" class="primary" type="button">保存</button></div>
+              <div class="fld go"><span>&nbsp;</span><button id="authTableCreateBtn" class="primary ghost" type="button">在 Base 中新建授权表…</button></div>
+            </div>
+            <div class="grid">
+              <label class="fld"><span>成员姓名</span><input type="text" id="issueName" /></label>
+              <label class="fld"><span>备注</span><input type="text" id="issueNote" placeholder="岗位 / 电脑" /></label>
+              <label class="fld"><span>到期 <em>（可选 YYYY-MM-DD）</em></span><input type="text" id="issueExpiry" /></label>
+              <div class="fld go"><span>&nbsp;</span><button id="issueBtn" class="primary" type="button">签发授权码</button></div>
+            </div>
+            <div id="issueResult" class="tip"></div>
+            <div class="grid"><button id="membersBtn" class="mini" type="button">刷新成员列表</button></div>
+            <div id="membersOut" class="membersout"></div>
+            <div class="ownnote"><b>离职 / 换人清单</b>：
+              ① 成员列表中把该成员切为「停用」——其工具随即锁定；
+              ② 若其可能保存过 App Secret，在飞书开放平台<b>重置 App Secret</b>，回到本页「验证并保存」新密钥，并把新密钥交给在职成员；
+              ③ 其电脑上的 secrets.bin 绑定其 Windows 账户，复制到别处无法解密。</div>
+          </div>
+        </details>
+      </section>
+
+      <section class="panel controls settings">
+        <div class="stephead"><b>🖥️ 运行</b>
+          <span class="stepnote">环境 / 端口保存后<b>下次启动桌面程序时生效</b>（当前进程不切换环境，避免半批写错表）。</span></div>
+        <div class="grid">
+          <div class="fld"><span>环境</span>
+            <div class="seg" id="envSeg">
+              <button data-env="prod" type="button">PROD 生产</button>
+              <button data-env="dev" type="button">DEV 测试</button>
+            </div></div>
+          <label class="fld"><span>端口</span><input type="text" id="setPort" placeholder="8787" /></label>
+          <div class="fld go"><span>&nbsp;</span><button id="runSaveBtn" class="primary" type="button">保存</button></div>
+        </div>
+        <div id="runInfo" class="tip runinfo"></div>
+        <details class="helpbox" id="opsBox">
+          <summary>本机最近执行记录</summary>
+          <div id="opsOut" class="hb"></div>
+        </details>
       </section>
     </section>
 

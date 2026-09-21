@@ -70,6 +70,7 @@ SAFETY
 """
 
 import re
+import copy
 import json
 import time
 import uuid
@@ -82,7 +83,10 @@ import lark_client as lark
 # sequential Feishu reads (~0.3–1 s each), and rows are independent — the
 # only shared state is the read-through ISA cache (locked) and the
 # precomputed group map (read-only). 4 workers ≈ 3–4× faster real batches.
-PLAN_WORKERS = 4
+PLAN_WORKERS = 6        # raised 4->6 (2026-09-21) once lark_client retries 限频 codes
+# A finished 预检 may be executed without a full re-plan for this long; the
+# fast Phase 0 re-reads the observed records instead (see _recheck).
+PLAN_REUSE_TTL = 20 * 60
 
 # ---------------------------------------------------------------------------
 # Field names (3.1 / 5.6) — identical in prod and the dev copies
@@ -333,19 +337,21 @@ def _search(table_id_, conditions, field_names, page_size=20):
 
 def _batch_get(table_id_, record_ids, field_names=None):
     """POST /records/batch_get -> {record_id: fields}. READ."""
-    if not record_ids:
+    ids = list(dict.fromkeys(record_ids))      # dedupe, keep order
+    if not ids:
         return {}
-    payload = {"record_ids": list(record_ids), "automatic_fields": False}
-    data = lark._api(
-        "POST",
-        f"/open-apis/bitable/v1/apps/{_base()}/tables/{table_id_}/records/batch_get",
-        payload=payload)
     out = {}
-    for rec in data.get("records", []):
-        f = rec.get("fields") or {}
-        if field_names:
-            f = {k: v for k, v in f.items() if k in field_names}
-        out[rec["record_id"]] = f
+    for i in range(0, len(ids), 100):          # Feishu caps batch_get at 100
+        payload = {"record_ids": ids[i:i + 100], "automatic_fields": False}
+        data = lark._api(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{_base()}/tables/{table_id_}/records/batch_get",
+            payload=payload)
+        for rec in data.get("records", []):
+            f = rec.get("fields") or {}
+            if field_names:
+                f = {k: v for k, v in f.items() if k in field_names}
+            out[rec["record_id"]] = f
     return out
 
 
@@ -482,6 +488,110 @@ def _sig(actions):
     ).hexdigest()[:16]
 
 
+# ---- observed-state snapshots (the "stored addresses" of the fast commit) --
+# While planning, every record a row's decision rested on is noted with the
+# exact values that mattered. commit() can then re-read JUST those records
+# (3 batch_get calls for the whole batch) and refuse any row whose world
+# moved, instead of re-running the full search-heavy plan. Only the keys
+# present in a snapshot are compared, so a partial read (e.g. inv-only) is
+# never mistaken for a change.
+def _obs31(f, plan_link_field):
+    o = {"awb": lark.flat_text(f.get(F31["awb"])) or "",
+         "actual": lark.flat_text(f.get(F31["actual"])) or ""}
+    if plan_link_field:
+        o["links"] = sorted(lark.link_ids(f.get(plan_link_field)))
+    return o
+
+
+def _obs5x(f, isa_field=None, inv_field=None):
+    o = {}
+    if isa_field:
+        o["isa"] = sorted(lark.link_ids(f.get(isa_field)))
+    if inv_field:
+        o["inv"] = sorted(lark.link_ids(f.get(inv_field)))
+    return o
+
+
+def _obs56(f, link56=None):
+    isa = lark.num_of(f.get(F56["isa"]))
+    o = {"isa": int(isa) if isa is not None else None,
+         "time": norm_time(lark.flat_text(f.get(F56["time"])))}
+    if link56:
+        o["trips"] = sorted(lark.link_ids(f.get(link56)))
+    return o
+
+
+def _note(row, kind, rec_id, obs):
+    """Record (or merge) a snapshot for `rec_id` in table kind '31'|'5x'|'56'."""
+    if rec_id:
+        row["observed"].setdefault(kind, {}).setdefault(rec_id, {}).update(obs)
+
+
+_OBS_LABEL = {"31": "3.1 记录", "5x": "出库计划", "56": "预约"}
+_OBS_FIELD = {"awb": "柜号", "actual": "实际板数", "links": "出库计划关联",
+              "isa": "预约关联/ISA", "inv": "库存关联", "time": "预约时间",
+              "trips": "出库计划关联"}
+
+
+def _recheck(rows, t31, t56, t5x, wiring):
+    """FAST Phase 0. Re-read exactly the records the approved rows observed at
+    plan time and compare with their snapshots. Returns
+    ({line_no: reason} for rows whose situation changed, records_checked).
+    Pure reads; a missing record counts as changed."""
+    need = {"31": set(), "5x": set(), "56": set()}
+    for r in rows:
+        for kind, recs in (r.get("observed") or {}).items():
+            need.setdefault(kind, set()).update(recs)
+    plan_link = wiring.get("plan_link_31")
+    isa_field, inv_field = wiring.get("isa_field"), wiring.get("inv_field")
+    link56 = wiring.get("link_on_56")
+    cur = {"31": _batch_get(t31, need["31"],
+                            [F31["awb"], F31["actual"]] + ([plan_link] if plan_link else [])),
+           "5x": (_batch_get(t5x, need["5x"], [x for x in (isa_field, inv_field) if x])
+                  if t5x and need["5x"] else {}),
+           "56": _batch_get(t56, need["56"],
+                            [F56["isa"], F56["time"]] + ([link56] if link56 else []))}
+    fresh = {"31": lambda f: _obs31(f, plan_link),
+             "5x": lambda f: _obs5x(f, isa_field, inv_field),
+             "56": lambda f: _obs56(f, link56)}
+    changed = {}
+    for r in rows:
+        for kind, recs in (r.get("observed") or {}).items():
+            for rid, before in recs.items():
+                f = cur.get(kind, {}).get(rid)
+                if f is None:
+                    changed[r["line_no"]] = f"{_OBS_LABEL[kind]} {rid} 已不存在"
+                    break
+                now = fresh[kind](f)
+                diff = [k for k in before if before[k] != now.get(k)]
+                if diff:
+                    changed[r["line_no"]] = (
+                        f"{_OBS_LABEL[kind]} {rid} 的 "
+                        f"{'/'.join(_OBS_FIELD.get(k, k) for k in diff)} 已被修改")
+                    break
+            if r["line_no"] in changed:
+                break
+    return changed, sum(len(v) for v in need.values())
+
+
+def _plan_reusable(cached, warehouse, text):
+    """Can commit() skip the full re-plan? Same env/warehouse/text, planned
+    recently enough, and produced by a plan() that recorded snapshots."""
+    if not isinstance(cached, dict) or not cached.get("rows"):
+        return False
+    if cached.get("env") != lark.env() or cached.get("warehouse") != warehouse:
+        return False
+    if cached.get("text_sha") != _text_sha(text):
+        return False
+    if time.time() - float(cached.get("planned_at") or 0) > PLAN_REUSE_TTL:
+        return False
+    return all("observed" in r for r in cached["rows"])
+
+
+def _text_sha(text):
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:16]
+
+
 # ===========================================================================
 # 3. PLAN — the READ-ONLY decision pass
 # ===========================================================================
@@ -586,7 +696,9 @@ def plan(warehouse, text, progress=None):
     }
     return {"env": lark.env(), "warehouse": warehouse,
             "account": wh.get("account"), "plan_table": wh.get("plan_table"),
-            "rows": rows, "summary": summary}
+            "rows": rows, "summary": summary,
+            # fast-commit reuse metadata (see _plan_reusable / _recheck)
+            "planned_at": time.time(), "text_sha": _text_sha(text)}
 
 
 def _resolve_isa(ctx, isa):
@@ -687,7 +799,8 @@ def _plan_row(ctx, p):
     row = {"line_no": p.get("line_no"), "raw": p.get("raw"),
            "parsed": None, "parse_error": None, "match": None,
            "match_error": None, "pallet": {}, "boxes": {}, "plan": {},
-           "actions": [], "warnings": [], "blockers": [], "notes": []}
+           "actions": [], "warnings": [], "blockers": [], "notes": [],
+           "observed": {}}          # record snapshots for the fast commit
 
     if "error" in p:
         row["parse_error"] = p["error"]
@@ -728,6 +841,7 @@ def _plan_row(ctx, p):
     rec = hits[0]
     f = rec.get("fields") or {}
     rid = rec["record_id"]
+    _note(row, "31", rid, _obs31(f, ctx["wiring"].get("plan_link_31")))
     est = lark.num_of(f.get(F31["estimated"]))
     existing = lark.flat_text(f.get(F31["actual"]))
     boxes31 = lark.num_of(f.get(F31["boxes"]))
@@ -806,6 +920,7 @@ def _plan_row(ctx, p):
             W(f"该行挂了 {len(linked_trips)} 个出库计划，按第一个核对")
         trip_id = linked_trips[0]
         trip = _batch_get(t5x, [trip_id], [isa_field, inv_field]).get(trip_id, {})
+        _note(row, "5x", trip_id, _obs5x(trip, isa_field, inv_field))
         trip_inv_ids = lark.link_ids(trip.get(inv_field))
         isa_ids = lark.link_ids(trip.get(isa_field))
 
@@ -829,6 +944,7 @@ def _plan_row(ctx, p):
             if p.get("isa") is not None:
                 ex = _resolve_isa(ctx, p["isa"])
                 if ex:
+                    _note(row, "56", ex["rec_id"], _obs56(ex["fields"], wiring.get("link_on_56")))
                     if ex["multi"]:
                         W(f"5.6 中 ISA {p['isa']} 存在多条，按最匹配的一条处理")
                     ex_trips = _appt_trips(ctx, ex)
@@ -858,6 +974,7 @@ def _plan_row(ctx, p):
         isa_rec = _batch_get(ctx["t56"], [isa_rec_id],
                              [F56["isa"], F56["time"], F56["dest"], F56["account"]]
                              ).get(isa_rec_id, {})
+        _note(row, "56", isa_rec_id, _obs56(isa_rec))
         cur_isa = lark.num_of(isa_rec.get(F56["isa"]))
         cur_time = norm_time(lark.flat_text(isa_rec.get(F56["time"])))
         row["plan"] = {"status": "has_plan", "trip_id": trip_id,
@@ -898,6 +1015,7 @@ def _plan_row(ctx, p):
         row["plan"]["status"] = "has_plan_mismatch"
         other = None if same_isa else _resolve_isa(ctx, p["isa"])
         if other and other["rec_id"] != isa_rec_id:
+            _note(row, "56", other["rec_id"], _obs56(other["fields"], wiring.get("link_on_56")))
             if other["multi"]:
                 W(f"5.6 中 ISA {p['isa']} 存在多条，改挂到最匹配的一条")
             other_time = norm_time(lark.flat_text(other["fields"].get(F56["time"])))
@@ -914,8 +1032,9 @@ def _plan_row(ctx, p):
                 if len(tgt_trips) > 1:
                     W(f"目标预约挂了 {len(tgt_trips)} 个出库计划（历史遗留，应为 "
                       f"1 对 1）— 已移挂到货件最多的那个（{tgt}）以便逐步归拢")
-                tgt_inv = lark.link_ids(_batch_get(t5x, [tgt], [inv_field])
-                                        .get(tgt, {}).get(inv_field))
+                tgt_f = _batch_get(t5x, [tgt], [inv_field]).get(tgt, {})
+                _note(row, "5x", tgt, _obs5x(tgt_f, None, inv_field))
+                tgt_inv = lark.link_ids(tgt_f.get(inv_field))
                 grp_sum = (ctx["groups"].get(p["isa"]) or {}).get("pallet_sum",
                                                                   provided)
                 tgt_total = _trip_total_pallets(ctx["t31"], tgt_inv) + grp_sum
@@ -967,6 +1086,7 @@ def _plan_row(ctx, p):
 
     ex = _resolve_isa(ctx, p["isa"])
     if ex:
+        _note(row, "56", ex["rec_id"], _obs56(ex["fields"], wiring.get("link_on_56")))
         if ex["multi"]:
             W(f"5.6 中 ISA {p['isa']} 存在多条，按最匹配的一条处理")
         acct = ex["fields"].get(F56["account"])
@@ -983,6 +1103,7 @@ def _plan_row(ctx, p):
                 W(f"该预约关联了 {len(trips56)} 个出库计划（历史遗留，应为 1 对 1）"
                   f"— 已挂到货件最多的那个（{trip_id}）以便逐步归拢")
             trip = _batch_get(t5x, [trip_id], [inv_field]).get(trip_id, {})
+            _note(row, "5x", trip_id, _obs5x(trip, None, inv_field))
             trip_inv_ids = lark.link_ids(trip.get(inv_field))
             if rid in trip_inv_ids:
                 row["plan"] = {"status": "already_on_trip", "trip_id": trip_id}
@@ -1075,12 +1196,15 @@ def _ctoken(*_parts):
     return str(uuid.uuid4())
 
 
-def commit(warehouse, text, approvals, client_env, progress=None):
+def commit(warehouse, text, approvals, client_env, progress=None, cached_plan=None):
     """Execute the operator-approved rows. `approvals` = [{line_no, sig}].
 
     PHASES (order matters — later phases need record ids from earlier ones):
-      0. re-plan everything from fresh reads; a row whose action signature no
-         longer equals the approved `sig` is SKIPPED ("情况已变化").
+      0. FAST: when `cached_plan` (the finished 预检 result the operator just
+         reviewed) is still reusable, re-read ONLY the records each approved
+         row observed and skip rows whose snapshot no longer matches
+         ("情况已变化"). Otherwise FULL: re-plan everything from fresh reads
+         and skip rows whose action signature differs from the approved `sig`.
       1. batch_create 5.x      — one 出库计划 per approved ISA group, created
                                  WITH its 预约信息 duplex link pointing at the
                                  EXISTING 5.6 record (back-link fills itself)
@@ -1115,21 +1239,33 @@ def commit(warehouse, text, approvals, client_env, progress=None):
             raise lark.LarkError("等待写入锁超过 5 分钟 — 可能有卡住的写入任务，"
                                  "请检查服务端后重试")
     try:
-        return _commit_locked(warehouse, text, approvals, tick)
+        return _commit_locked(warehouse, text, approvals, tick, cached_plan)
     finally:
         lark.WRITE_LOCK.release()
 
 
-def _commit_locked(warehouse, text, approvals, tick):
+def _commit_locked(warehouse, text, approvals, tick, cached_plan=None):
     warehouse = (warehouse or "").strip()
+    wh = WAREHOUSES.get(warehouse)
+    if wh is None:
+        raise lark.LarkError(f"未知仓库供应商「{warehouse}」")
+    plan_table = wh.get("plan_table")
+    t31, t56 = lark.table_id("3.1"), lark.table_id("5.6")
+    t5x = lark.table_id(plan_table) if plan_table else None
+    wiring = _env_wiring(plan_table)
 
-    def replan_tick(**kw):                    # prefix the re-plan's stages
-        if kw.get("stage"):
-            kw["stage"] = "复检 · " + kw["stage"]
-        tick(**kw)
-
-    tick(stage="复检（重新预检所有行）")
-    result = plan(warehouse, text, progress=replan_tick)   # Phase 0 — fresh reads
+    # ---- Phase 0: fast recheck of the reviewed plan, or a full re-plan ----
+    fast = _plan_reusable(cached_plan, warehouse, text)
+    if fast:
+        tick(stage="复检 · 快速核对预检时读取的记录", done=0, total=0, current="")
+        result = copy.deepcopy(cached_plan)   # the job store keeps its copy
+    else:
+        def replan_tick(**kw):                # prefix the re-plan's stages
+            if kw.get("stage"):
+                kw["stage"] = "复检 · " + kw["stage"]
+            tick(**kw)
+        tick(stage="复检（重新预检所有行）")
+        result = plan(warehouse, text, progress=replan_tick)   # fresh reads
     by_line = {r["line_no"]: r for r in result["rows"]}
     approved = {}
     for a in approvals or []:
@@ -1148,13 +1284,18 @@ def _commit_locked(warehouse, text, approvals, tick):
             r["commit"] = {"done": True, "skipped": "无需改动"}
         else:
             approved[r["line_no"]] = r
+    if fast and approved:
+        # Compare the world with the snapshots; refuse moved rows only.
+        changed, n_checked = _recheck(list(approved.values()), t31, t56, t5x, wiring)
+        for line_no, why in changed.items():
+            r = approved.pop(line_no)
+            r["commit"] = {"done": False,
+                           "skipped": f"情况已变化（{why}）— 请重新查询后再执行"}
+        result["recheck"] = {"mode": "fast", "records": n_checked,
+                             "changed": len(changed)}
+    else:
+        result["recheck"] = {"mode": "full"}
     rows = list(approved.values())
-
-    wh = WAREHOUSES[warehouse]
-    plan_table = wh.get("plan_table")
-    t31, t56 = lark.table_id("3.1"), lark.table_id("5.6")
-    t5x = lark.table_id(plan_table) if plan_table else None
-    wiring = _env_wiring(plan_table)
     isa_field = wiring.get("isa_field")   # None when trips are disabled — no
     base = _base()                        # trip actions get planned then anyway
 

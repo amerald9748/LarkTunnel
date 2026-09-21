@@ -44,6 +44,70 @@ LARK_PORT=9000 python webapp/server.py
 
 ---
 
+## 🖥️ 桌面程序 · ⚙ 设置 · 团队授权（2026-09-21 打磨阶段）
+
+### 桌面程序（LarkTunnel.exe）
+
+```bash
+webapp\build.bat            # PyInstaller 一键打包 → webapp\dist\LarkTunnel\LarkTunnel.exe（先跑单测）
+webapp\run-desktop.bat      # 不打包，直接从源码启动桌面壳（python desktop.py --console）
+```
+
+> 只运行 **`dist\LarkTunnel\LarkTunnel.exe`**。PyInstaller 的中间产物现在放在 `.tmp\pyi-build`
+> （早期版本会在 `webapp\build\LarkTunnel\` 留下一个没有 `_internal\` 的半成品 exe，双击报
+> "Failed to load Python DLL"）。图标：`static\larktunnel.ico`——公司 logo 的**双色调变体**
+> （深红→黑渐变底，logo 压成金/米色双色调，金色「隧道」框向中心收缩，方案 B），刻意与另一个
+> 用原 logo 的程序区分；`python webapp\make_icon.py <logo.png> <预览目录> B` 可重新生成
+> （A 反色/海军蓝、C 色相翻转/青色光环 为备选），同一图案的 `larktunnel.png` 作为网页 favicon。
+
+`desktop.py` 是一个很薄的壳：读 `%APPDATA%\LarkTunnel\settings.json`（环境/端口）→
+若该端口已有 LarkTunnel 服务（如 Task Scheduler 的生产服务）就**挂接**，否则在进程内启动
+`server.build_server()` → 用 **pywebview + Edge WebView2** 开一个原生窗口（不可用时退化为
+`msedge --app=`，再退化为默认浏览器）→ 窗口关闭（或页面心跳 `/api/ping` 停止 90 s）后关掉自
+己启动的服务。分发：把 `dist\LarkTunnel` 整个文件夹压缩给同事；同事首次打开在 ⚙ 设置 填
+App ID / Secret 与授权码即可。日志：`%APPDATA%\LarkTunnel\logs\desktop.log`。
+
+### 文件放哪里（apppaths.py）
+
+| 类型 | 源码运行 | 桌面 exe |
+|---|---|---|
+| 只读程序资源 `config/config.js`、`static/` | 仓库目录 | 打包内 `_internal/` |
+| **每用户私密**：`settings.json`、`secrets.bin` | `%APPDATA%\LarkTunnel` | 同 |
+| 机器状态：`logs/audit.db`、`logs/ops.jsonl`、`config/operators-auto.json` | 仓库目录（git 忽略） | `%APPDATA%\LarkTunnel` |
+
+### ⚙ 设置页
+
+* **飞书应用凭据** — App ID / App Secret 用 Windows **DPAPI**（当前用户作用域 + 应用熵）加密成
+  `secrets.bin`；绑定该 Windows 账户+机器，复制到别处解不开。保存前先「测试连接」（换 token +
+  列 Base 表），验证通过才落盘，落盘即失效旧 token 缓存（`lark_client.invalidate_token()`）。
+  凭据解析顺序：`secrets.bin` → 环境变量 `LARK_APP_ID/LARK_APP_SECRET` → 旧的
+  `config/secrets.txt`（开发机继续可用）。密钥永不返回浏览器（只回 `gXz…3r` 提示）。
+* **操作人** — 显示在右上角，并写进本机 `logs/ops.jsonl`（每次执行一行：谁 / 哪个流程 / 环境 /
+  仓库 / 成功·核实·失败·跳过计数 / 耗时）。飞书侧创建人/修改人永远是应用，这里补上「是谁」。
+* **团队授权**（`access_control.py`）— 管理员在 Base 里建一张 **授权表**（按钮「在 Base 中新建授
+  权表…」需确认；字段 授权码/姓名/状态/到期/备注/最近使用），为每位成员「签发授权码」（`LT-…`，
+  只显示一次）。成员在自己的 ⚙ 设置 填授权码。之后每 5 分钟校验一次：不存在 / 状态≠启用 /
+  已到期 → **整套工具锁定**（遮罩 + 服务端拒绝所有飞书路由，只留设置页）。飞书不可达时沿用最
+  近一次成功验证 24 小时，从未验证过则锁定。未配置授权表 = 单机模式，不校验。
+* **离职 / 换人清单**：① 成员列表把该人切为「停用」（几分钟内锁定）② 若其可能保存过 App Secret，
+  飞书开放平台重置 App Secret → 本页「验证并保存」新密钥 → 通知在职成员更新 ③ 其电脑上的
+  `secrets.bin` 绑定其 Windows 账户，拷走无用。
+* **运行** — 环境（prod/dev）与端口保存后**下次启动桌面程序时生效**（当前进程不切环境，避免半批
+  写错表）。
+
+### ⚡ 执行加速：预检快照 + 快速复检
+
+预检（plan）时每一行把决策所依赖的记录**连同当时读到的值**记进 `row.observed`
+（3.1：柜号/实际板数/出库计划关联；出库计划：预约关联/库存关联；5.6：ISA/时间/出库计划关联）。
+点「执行」时前端带上 `plan_job_id`，服务端从 `sync_jobs` 取回该预检结果：若同环境、同仓库、同文本、
+20 分钟内 → **快速复检**：只按记录 id `batch_get` 这些记录（每表一批、100 条一片）与快照逐字段比对，
+有任何变化的行以「情况已变化（预约 recXXX 的 预约时间 已被修改）」拒绝，其余照常写入并回读核实。
+否则退回原来的**完整重检**（重新 plan + 签名比对）。dev 实测：拒绝路径 8 s vs 完整重检 27 s，
+写入路径省掉整轮 3.1 搜索。`PLAN_WORKERS` 4→6，`lark_client` 对限频码（429/1254290/1254291/
+99991400/99991403）自动退避重试。
+
+---
+
 ## ⚡ 预约同步（核心工作流）
 
 实现 `docs/40 Workflows/Appointment Sync Runbook.md`，核心代码
@@ -414,7 +478,14 @@ xlsx 读取优先用 `openpyxl`（能正确处理日期单元格），没装则�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/health` | 存活检查 |
+| GET | `/api/health` | 存活检查（含 version / env）|
+| GET | `/api/ping` | 页面心跳（桌面壳据此判断窗口是否还在）|
+| GET/POST | `/api/settings` | ⚙ 设置读取 / 修改非密项（operator_name, access_key, auth_table, env, port）|
+| POST | `/api/settings/test` · `/credentials` · `/credentials/clear` | 测试连接（可带未保存的凭据）· 验证后 DPAPI 保存 · 清除 |
+| GET | `/api/access/status?force=1` · `/api/access/members` | 本人授权状态 · 成员列表（管理员）|
+| POST | `/api/access/create_table` · `/issue` · `/set_status` | 新建授权表（需 confirm:true）· 签发授权码 · 启用/停用 |
+| GET | `/api/ops/log?n=50` | 本机执行记录（logs/ops.jsonl）|
+| POST | `/api/sync/commit` | 现在接受 `plan_job_id`（复用预检快照，快速复检；结果含 `recheck:{mode,records,changed}`）|
 | GET | `/api/tables` | config.js 里的表注册表 + 可查询字段 + 时区 |
 | GET | `/api/views?table=<table_id>` | 该表的全部视图 |
 | POST | `/api/query` | `{table, view_id, field_key:"awb"\|"isa", value, mode:"contains"\|"is"}` |

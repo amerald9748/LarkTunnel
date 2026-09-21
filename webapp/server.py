@@ -12,12 +12,18 @@ credentials server-side, so it must not be exposed on the network).
 """
 
 import os
+import sys
 import json
+import time
 import base64
 import mimetypes
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import apppaths
+import app_settings
+import access_control
+import ops_log
 import lark_client as lark
 import file_parse
 import appointment_sync
@@ -53,6 +59,42 @@ def _live_options(table_id, field_name):
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
 PORT = int(os.environ.get("LARK_PORT", "8787"))
+VERSION = "2.0.0"
+
+# Browser heartbeat (GET /api/ping every ~20 s from app.js). The desktop shell
+# uses it to notice that the last window went away when it cannot observe the
+# window itself (Edge --app fallback / plain browser).
+_LAST_PING = [0.0]
+
+
+def last_ping():
+    return _LAST_PING[0]
+
+
+# POST routes that must work while the tool is LOCKED (no credentials yet,
+# or this person's 授权 was switched off) — everything the ⚙ 设置 page needs.
+_OPEN_POSTS = {"/api/settings", "/api/settings/credentials",
+               "/api/settings/credentials/clear", "/api/settings/test",
+               "/api/access/create_table", "/api/access/issue",
+               "/api/access/set_status"}
+
+
+def _operator():
+    """Who is at the keyboard — 授权表 name in team mode, else the local
+    operator_name setting. For logs only."""
+    acc = access_control.status()
+    return acc.get("name") or app_settings.get_settings().get("operator_name") or ""
+
+
+def _settings_public():
+    """settings.json minus anything worth protecting (the 授权码 is shown as
+    a hint only; re-enter to change)."""
+    st = app_settings.get_settings()
+    key = st.get("access_key") or ""
+    out = {k: v for k, v in st.items() if k != "access_key"}
+    out["access_key_set"] = bool(key)
+    out["access_key_hint"] = (key[:5] + "…" + key[-3:]) if len(key) > 10 else ("已设置" if key else "")
+    return out
 
 # Field names we allow the UI to query by (label -> {field, default operator})
 QUERY_FIELDS = {
@@ -100,7 +142,30 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/" or route == "":
                 return self._send_file(os.path.join(STATIC, "index.html"))
             if route == "/api/health":
+                return self._send_json({"ok": True, "version": VERSION, "env": lark.env()})
+            if route == "/api/ping":
+                _LAST_PING[0] = time.time()
                 return self._send_json({"ok": True})
+            if route == "/api/settings":
+                # ⚙ 设置 bootstrap — never includes the App Secret itself
+                return self._send_json({
+                    "ok": True, "settings": _settings_public(),
+                    "credentials": app_settings.credential_status(),
+                    "access": access_control.status(),
+                    "env": lark.env(), "port": PORT, "version": VERSION,
+                    "frozen": apppaths.is_frozen(), "data_dir": apppaths.data_dir(),
+                    "ops_log": ops_log.path(),
+                    "base": lark.config_values().get("base_token"),
+                    "dev_available": bool(lark.config_values().get("dev_tables"))})
+            if route == "/api/access/status":
+                force = (qs.get("force") or ["0"])[0] == "1"
+                return self._send_json({"ok": True, "access": access_control.status(force=force)})
+            if route == "/api/access/members":
+                return self._send_json({"ok": True, "members": access_control.list_members(),
+                                        "table": app_settings.get_settings().get("auth_table")})
+            if route == "/api/ops/log":
+                n = int((qs.get("n") or ["50"])[0])
+                return self._send_json({"ok": True, "entries": ops_log.tail(max(1, min(n, 500)))})
             if route == "/api/tables":
                 cfg = lark.config_values()
                 # In dev mode the 3.1/5.6 labels resolve to the dev copies —
@@ -241,11 +306,25 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": False, "error": f"环境不匹配：页面为 {client_env}，"
                                        f"服务端为 {lark.env()} — 请刷新页面"}, 200)
 
+        # FAST PATH: the operator just reviewed a finished 预检 job — hand its
+        # result to commit(), which re-reads only the records that plan
+        # observed instead of re-running the whole search-heavy plan.
+        # (appointment_sync decides whether it is still reusable.)
+        cached = None
+        pj = sync_jobs.get(payload.get("plan_job_id") or "")
+        if pj and pj.get("kind") == "plan" and pj.get("state") == "done":
+            cached = pj.get("result")
+
         def run(progress):
             return appointment_sync.commit(warehouse, text, approvals,
-                                           client_env, progress=progress)
+                                           client_env, progress=progress,
+                                           cached_plan=cached)
+        operator = _operator()
+
+        def log(job_id, res, elapsed):
+            ops_log.record("sync", operator, lark.env(), warehouse, job_id, elapsed, res)
         try:
-            job = sync_jobs.start("commit", run)
+            job = sync_jobs.start("commit", run, on_done=log)
         except sync_jobs.Busy as e:
             # single-flight: refuse loudly instead of queueing invisibly
             return self._send_json({"ok": False, "busy": True, "error": str(e)}, 200)
@@ -279,9 +358,13 @@ class Handler(BaseHTTPRequestHandler):
         def run(progress):
             return appointment_create.commit(warehouse, text, approvals,
                                              client_env, progress=progress)
+        operator = _operator()
+
+        def log(job_id, res, elapsed):
+            ops_log.record("create56", operator, lark.env(), warehouse, job_id, elapsed, res)
         try:
             # kind 'commit' => single-flight ACROSS both write flows
-            job = sync_jobs.start("commit", run)
+            job = sync_jobs.start("commit", run, on_done=log)
         except sync_jobs.Busy as e:
             return self._send_json({"ok": False, "busy": True, "error": str(e)}, 200)
         except Exception as e:  # noqa
@@ -309,9 +392,14 @@ class Handler(BaseHTTPRequestHandler):
         def run(progress):
             return inventory_import.commit(payload, approvals, client_env,
                                            progress=progress)
+        operator = _operator()
+
+        def log(job_id, res, elapsed):
+            ops_log.record("import", operator, lark.env(),
+                           payload.get("warehouse") or "", job_id, elapsed, res)
         try:
             # kind 'commit' => single-flight across ALL webapp write flows
-            job = sync_jobs.start("commit", run)
+            job = sync_jobs.start("commit", run, on_done=log)
         except sync_jobs.Busy as e:
             return self._send_json({"ok": False, "busy": True, "error": str(e)}, 200)
         except Exception as e:  # noqa
@@ -427,6 +515,81 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
         return self._send_json({"ok": True, "job": job})
 
+    # ---- ⚙ 设置 · credentials / access control -----------------------------
+    def _handle_settings(self, payload):
+        """Patch non-secret settings. env/port take effect on the next start
+        of the desktop app (this process keeps its env — see lark.ENV)."""
+        patch = {}
+        for k in ("operator_name", "auth_table", "env", "port", "window"):
+            if k in payload:
+                patch[k] = payload[k]
+        if "access_key" in payload and (payload["access_key"] or "").strip():
+            patch["access_key"] = payload["access_key"].strip()   # blank = keep
+        if payload.get("clear_access_key"):
+            patch["access_key"] = ""
+        if "env" in patch and patch["env"] not in ("prod", "dev"):
+            return self._send_json({"ok": False, "error": "env 只能是 prod 或 dev"}, 200)
+        if "port" in patch:
+            try:
+                patch["port"] = int(patch["port"])
+                assert 1024 <= patch["port"] <= 65535
+            except (ValueError, AssertionError):
+                return self._send_json({"ok": False, "error": "端口应为 1024-65535 的整数"}, 200)
+        st = app_settings.update_settings(patch)
+        if "access_key" in patch or "auth_table" in patch:
+            access_control.invalidate()
+        return self._send_json({"ok": True, "settings": _settings_public(),
+                                "access": access_control.status(force=True),
+                                "restart_needed": any(k in patch for k in ("env", "port"))
+                                and (st.get("env") != lark.env() or st.get("port") != PORT)})
+
+    def _handle_credentials(self, payload):
+        app_id = (payload.get("app_id") or "").strip()
+        secret = (payload.get("app_secret") or "").strip()
+        # verify BEFORE storing: a typo must not replace working credentials
+        test = app_settings.test_connection(app_id, secret)
+        if not test.get("ok"):
+            return self._send_json({"ok": False, "error": test.get("error"), "test": test}, 200)
+        try:
+            app_settings.save_credentials(app_id, secret)
+        except ValueError as e:
+            return self._send_json({"ok": False, "error": str(e)}, 200)
+        access_control.invalidate()
+        return self._send_json({"ok": True, "test": test,
+                                "credentials": app_settings.credential_status()})
+
+    def _handle_credentials_clear(self, _payload):
+        app_settings.clear_credentials()
+        access_control.invalidate()
+        return self._send_json({"ok": True, "credentials": app_settings.credential_status()})
+
+    def _handle_settings_test(self, payload):
+        test = app_settings.test_connection(payload.get("app_id"), payload.get("app_secret"))
+        return self._send_json({"ok": True, "test": test})
+
+    def _handle_access_create_table(self, payload):
+        # Adds a table to the LIVE Base — the UI asks for explicit confirmation
+        # and sends confirm=true; refuse anything else.
+        if payload.get("confirm") is not True:
+            return self._send_json({"ok": False, "error": "需要确认后才会在 Base 中创建授权表"}, 200)
+        if app_settings.get_settings().get("auth_table"):
+            return self._send_json({"ok": False, "error": "已配置授权表 — 如需重建，请先清空授权表 ID"}, 200)
+        tid = access_control.create_auth_table((payload.get("name") or "").strip()
+                                               or "LarkTunnel 授权表")
+        return self._send_json({"ok": True, "table": tid, "settings": _settings_public()})
+
+    def _handle_access_issue(self, payload):
+        out = access_control.issue_key(payload.get("name") or "", payload.get("note") or "",
+                                       payload.get("expiry") or "")
+        return self._send_json({"ok": True, **out})
+
+    def _handle_access_set_status(self, payload):
+        rid = payload.get("record_id")
+        if not rid:
+            return self._send_json({"ok": False, "error": "缺少 record_id"}, 200)
+        access_control.set_status(rid, bool(payload.get("active")))
+        return self._send_json({"ok": True, "members": access_control.list_members()})
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         # NOTE: /api/upload · /api/dryrun_56 · /api/commit_56 were RETIRED
@@ -438,7 +601,7 @@ class Handler(BaseHTTPRequestHandler):
                                "/api/import/plan", "/api/import/commit",
                                "/api/audit/search", "/api/audit/delete",
                                "/api/audit/harvest", "/api/audit/resolve",
-                               "/api/verify"):
+                               "/api/verify", *_OPEN_POSTS):
             return self.send_error(404, "Not found")
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -447,6 +610,35 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except Exception as e:
             return self._send_json({"ok": False, "error": f"bad request: {e}"}, 200)
+
+        # ACCESS GATE — every Feishu-touching route is refused while this
+        # person's 授权 is off (team mode) so a switched-off teammate cannot
+        # read or write anything, not merely lose the UI. Settings routes
+        # stay open so they can enter a new key / credentials.
+        if parsed.path not in _OPEN_POSTS:
+            acc = access_control.status()
+            if not acc.get("ok"):
+                return self._send_json({"ok": False, "locked": True,
+                                        "error": acc.get("reason") or "未授权"}, 200)
+        try:
+            if parsed.path == "/api/settings":
+                return self._handle_settings(payload)
+            if parsed.path == "/api/settings/credentials":
+                return self._handle_credentials(payload)
+            if parsed.path == "/api/settings/credentials/clear":
+                return self._handle_credentials_clear(payload)
+            if parsed.path == "/api/settings/test":
+                return self._handle_settings_test(payload)
+            if parsed.path == "/api/access/create_table":
+                return self._handle_access_create_table(payload)
+            if parsed.path == "/api/access/issue":
+                return self._handle_access_issue(payload)
+            if parsed.path == "/api/access/set_status":
+                return self._handle_access_set_status(payload)
+        except lark.LarkError as e:
+            return self._send_json({"ok": False, "error": str(e)}, 200)
+        except Exception as e:  # noqa
+            return self._send_json({"ok": False, "error": f"server error: {e}"}, 200)
 
         if parsed.path == "/api/parse":
             return self._handle_parse(payload)
@@ -529,24 +721,52 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-def main():
-    # Fail fast with a clear message if config/secrets are unreadable.
+def _safe_console():
+    """Windows consoles/log redirects default to the GBK codec: a stray
+    non-GBK character in a status print (env values, table labels) would kill
+    the server at startup. Replace instead of raising."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def build_server(port=None):
+    """Create (but do not run) the HTTP server on 127.0.0.1:<port>. Shared by
+    the console entry point below and the desktop shell (desktop.py), which
+    runs serve_forever() in a thread and shuts it down when the window
+    closes. Raises OSError when the port is taken."""
+    _safe_console()
+    port = PORT if port is None else int(port)
     try:
         cfg = lark.config_values()
-        print(f"[LarkTunnel] env={lark.env().upper()}  base={cfg['base_token']}  "
+        print(f"[LarkTunnel] v{VERSION} env={lark.env().upper()}  base={cfg['base_token']}  "
               f"tables={list(cfg['tables'])}")
         if lark.env() == "dev":
             print(f"[LarkTunnel] DEV MODE — 3.1/5.6 resolve to {cfg['dev_tables']}")
     except lark.LarkError as e:
         print(f"[LarkTunnel] CONFIG ERROR: {e}")
+    cs = app_settings.credential_status()
+    if cs["configured"]:
+        print(f"[LarkTunnel] credentials: {cs['app_id']} (source={cs['source']})")
+    else:
+        # Not fatal any more: the ⚙ 设置 page collects them at runtime.
+        print("[LarkTunnel] NO CREDENTIALS YET - open the Settings tab in the app to enter App ID / Secret")
+    print(f"[LarkTunnel] data dir: {apppaths.data_dir()}  access mode: {access_control.mode()}")
     # Pre-warm the cross-table id index (opt/fld resolver) in the background —
     # cold build is 1-2 min of metadata calls; warmed, 解析 answers instantly.
+    if cs["configured"]:
+        try:
+            audit_view.warm_indexes_async()
+        except Exception as e:  # noqa
+            print(f"[LarkTunnel] index warm-up not started: {e}")
+    return _Server(("127.0.0.1", port), Handler)
+
+
+def main():
     try:
-        audit_view.warm_indexes_async()
-    except Exception as e:  # noqa
-        print(f"[LarkTunnel] index warm-up not started: {e}")
-    try:
-        httpd = _Server(("127.0.0.1", PORT), Handler)
+        httpd = build_server(PORT)
     except OSError as e:
         print(f"[LarkTunnel] CANNOT BIND :{PORT} — already in use ({e}). "
               f"Set LARK_PORT to a free port.")

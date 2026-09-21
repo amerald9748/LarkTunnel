@@ -33,7 +33,8 @@ _name_lock = threading.Lock()
 # 通讯录授权范围 (contact API error 41050). Hot-reloads on file change.
 # (A hand-maintained operators.json layer existed briefly; removed 2026-09-03
 #  at the operator's request — the harvest resolution suffices.)
-OPERATORS_AUTO_PATH = os.path.join(lark.ROOT, "config", "operators-auto.json")
+import apppaths
+OPERATORS_AUTO_PATH = apppaths.state_path("config", "operators-auto.json")
 _ops_cache = {}          # path -> {"mtime": float, "map": dict}
 
 

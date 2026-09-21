@@ -90,6 +90,7 @@ function initTabs() {
     [...$("#tabs").children].forEach((x) => x.classList.toggle("on", x === b));
     for (const pane of document.querySelectorAll(".tabpane"))
       pane.hidden = pane.id !== "tab-" + b.dataset.tab;
+    refreshLockOverlay();
   });
 }
 function switchTab(name) {
@@ -101,6 +102,8 @@ function switchTab(name) {
 async function boot() {
   initTheme();
   initTabs();
+  initSettings();
+  await loadSettings();     // credentials / 授权 state gate everything else
   bootSync();
   try {
     const r = await fetch("/api/tables").then((x) => x.json());
@@ -565,7 +568,7 @@ function clip(s) { s = String(s); return s.length > 60 ? s.slice(0, 58) + "…" 
    execute. Client-side validation mirrors webapp/appointment_sync.parse_line
    for INSTANT feedback; the server re-validates authoritatively.
    ═══════════════════════════════════════════════════════════════════════════ */
-const sync = { meta: null, warehouse: null, plan: null, busy: false };
+const sync = { meta: null, warehouse: null, plan: null, busy: false, planJobId: null };
 
 // Destination: SHAPE check only — the real list is the LIVE 5.6 目的地
 // options delivered by /api/sync/meta (sync.meta.dest_options). Never
@@ -870,6 +873,7 @@ async function planSync() {
     }).then((x) => x.json());
     if (!r.ok) throw new Error(r.error || "预检失败");
     rememberJob(r.job.id, "plan");
+    sync.planJobId = r.job.id;      // 执行 reuses this plan's snapshots
     const job = await pollJob(r.job.id, "plan");
     forgetJob();
     hideProgress();
@@ -1074,11 +1078,17 @@ function renderCommitOutcome(r) {
   const failed = r.rows.filter((x) => (x.commit || {}).error).length;
   const skipped = r.rows.filter((x) => (x.commit || {}).skipped).length;
   (failed ? cerr : clog)("执行", "完成", `成功=${done} 回读核实=${verified} 失败=${failed} 跳过=${skipped}`);
+  const rc = r.recheck || {};
+  const rcPill = rc.mode === "fast"
+    ? el("span", { class: "pill" + (rc.changed ? " warnpill" : ""), title: "执行前只回读预检时记下的记录并与快照比对；有变化的行被拒绝" },
+        `⚡ 快速复检 ${rc.records} 条记录` + (rc.changed ? ` · ${rc.changed} 行情况已变化` : ""))
+    : el("span", { class: "pill", title: "预检结果已过期或不可复用，执行前重新完整预检" }, "复检：完整重检");
   setSyncStatus([
     el("span", { class: "pill" }, "✅ 已执行 ", el("b", {}, String(done))),
     el("span", { class: "pill" }, "回读核实 ", el("b", {}, String(verified))),
     failed ? el("span", { class: "pill warnpill" }, `✗ 失败 ${failed}`) : null,
     skipped ? el("span", { class: "pill warnpill" }, `跳过 ${skipped}`) : null,
+    rcPill,
   ].filter(Boolean), failed > 0);
   renderSyncRows(r, true);
   renderWarningsSummary(r);
@@ -1106,7 +1116,7 @@ async function runCommit(approvals) {
     const r = await fetch("/api/sync/commit", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ warehouse: sync.warehouse, text: $("#syncInput").value,
-        approvals, env: sync.plan.env }),
+        approvals, env: sync.plan.env, plan_job_id: sync.planJobId || null }),
     }).then((x) => x.json());
     if (!r.ok) {
       if (r.busy) {
@@ -1166,7 +1176,7 @@ async function reattachJob() {
       const finished = await pollJob(job.id, saved.kind);
       hideProgress();
       if (saved.kind === "commit") renderCommitOutcome(finished.result);
-      else if (saved.kind === "plan") renderPlanOutcome(finished.result);
+      else if (saved.kind === "plan") { sync.planJobId = job.id; renderPlanOutcome(finished.result); }
       else if (isImp) renderImport(finished.result, saved.kind === "impcommit");
       else renderC56(finished.result, saved.kind === "c56commit");
       const wkey = finished.result && finished.result.warehouse;
@@ -2231,6 +2241,276 @@ function renderWarningsSummary(r) {
     btn.textContent = "已复制";
   });
   mount.append(btn);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ⚙ 设置 — credentials (DPAPI store, server-side), operator, team 授权,
+   runtime. Also owns the LOCK overlay and the desktop heartbeat.
+   The App Secret is write-only from here: it goes up once, never comes back.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const settings = { data: null, locked: false, lockReason: "", envPick: "prod" };
+const ACCESS_CHECK_MS = 5 * 60 * 1000;
+const PING_MS = 20 * 1000;
+
+async function api(url, body) {
+  const r = await fetch(url, body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return r.json();
+}
+
+function tip(sel, text, kind) {
+  const n = $(sel); if (!n) return;
+  n.textContent = text || "";
+  n.className = n.className.replace(/\b(okmsg|badmsg)\b/g, "").trim();
+  if (kind) n.classList.add(kind === "ok" ? "okmsg" : "badmsg");
+}
+
+function initSettings() {
+  $("#whoChip").addEventListener("click", () => switchTab("settings"));
+  $("#lockSettingsBtn").addEventListener("click", () => switchTab("settings"));
+  $("#credTestBtn").addEventListener("click", testCredentials);
+  $("#credSaveBtn").addEventListener("click", saveCredentials);
+  $("#credClearBtn").addEventListener("click", clearCredentials);
+  $("#operatorSaveBtn").addEventListener("click", async () => {
+    const r = await api("/api/settings", { operator_name: $("#setOperator").value.trim() });
+    if (r.ok) { applySettings(r); flash($("#operatorSaveBtn"), "已保存"); }
+  });
+  $("#accessKeySaveBtn").addEventListener("click", saveAccessKey);
+  $("#accessCheckBtn").addEventListener("click", () => checkAccess(true));
+  $("#authTableSaveBtn").addEventListener("click", async () => {
+    const r = await api("/api/settings", { auth_table: $("#setAuthTable").value.trim() });
+    if (!r.ok) return tip("#accessResult", "⚠ " + r.error, "bad");
+    applySettings(r); tip("#accessResult", "✓ 授权表已保存", "ok"); loadMembers();
+  });
+  $("#authTableCreateBtn").addEventListener("click", createAuthTable);
+  $("#issueBtn").addEventListener("click", issueKey);
+  $("#membersBtn").addEventListener("click", loadMembers);
+  $("#ownerBox").addEventListener("toggle", (e) => { if (e.target.open) loadMembers(); });
+  $("#opsBox").addEventListener("toggle", (e) => { if (e.target.open) loadOps(); });
+  $("#envSeg").addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    settings.envPick = b.dataset.env;
+    [...$("#envSeg").children].forEach((x) => x.classList.toggle("on", x === b));
+  });
+  $("#runSaveBtn").addEventListener("click", async () => {
+    const r = await api("/api/settings", { env: settings.envPick, port: $("#setPort").value.trim() || 8787 });
+    if (!r.ok) return tip("#runInfo", "⚠ " + r.error, "bad");
+    applySettings(r);
+    tip("#runInfo", r.restart_needed ? "✓ 已保存 — 下次启动桌面程序时生效（当前进程保持 " +
+      (settings.data.env || "").toUpperCase() + " · 端口 " + settings.data.port + "）" : "✓ 已保存", "ok");
+  });
+  setInterval(() => checkAccess(false), ACCESS_CHECK_MS);
+  setInterval(() => fetch("/api/ping").catch(() => {}), PING_MS);   // desktop shell heartbeat
+}
+
+function flash(btn, text) {
+  const old = btn.textContent; btn.textContent = text;
+  setTimeout(() => { btn.textContent = old; }, 1500);
+}
+
+async function loadSettings() {
+  let r;
+  try { r = await api("/api/settings"); } catch (e) { return; }
+  if (!r.ok) return;
+  applySettings(r);
+  if (!r.credentials.configured) {
+    switchTab("settings");
+    $("#credPanel").classList.add("attention");
+    tip("#credStatus", "尚未配置飞书应用凭据 — 请填写 App ID / App Secret 后「验证并保存」", "bad");
+  }
+}
+
+function applySettings(r) {
+  const d = settings.data = Object.assign({}, settings.data || {}, r);
+  const st = d.settings || {};
+  const cred = d.credentials || {};
+  const acc = d.access || {};
+  // ---- credentials ----
+  if (cred.configured) {
+    const src = { dpapi: "本机加密存储", env: "环境变量", legacy: "config/secrets.txt（旧方式）" }[cred.source] || cred.source;
+    tip("#credStatus", `✓ 已配置：${cred.app_id} · 密钥 ${cred.secret_hint} · 来源：${src}`, "ok");
+    if (!$("#setAppId").value) $("#setAppId").value = cred.app_id || "";
+  } else if (!$("#credStatus").textContent) {
+    tip("#credStatus", "未配置凭据", "bad");
+  }
+  $("#credClearBtn").disabled = cred.source !== "dpapi";
+  $("#credClearBtn").title = cred.source === "dpapi" ? "删除本机加密保存的 App ID / Secret" : "仅可清除本机加密存储的凭据";
+  // ---- operator ----
+  if (document.activeElement !== $("#setOperator")) $("#setOperator").value = st.operator_name || "";
+  // ---- access ----
+  $("#accessKeyHint").textContent = st.access_key_set ? `（已保存 ${st.access_key_hint}，重新输入可替换）` : "（未设置）";
+  $("#setAuthTable").value = st.auth_table || "";
+  tip("#accessMode", acc.mode === "team"
+    ? (acc.ok ? `✓ 团队模式 · 已授权：${acc.name || "—"}` : `✗ 团队模式 · 未授权：${acc.reason || ""}`)
+    : "单机模式 — 未配置授权表，不校验授权码（管理员可在下方创建授权表启用团队模式）",
+    acc.mode === "team" ? (acc.ok ? "ok" : "bad") : null);
+  applyLock(acc);
+  // ---- runtime ----
+  settings.envPick = st.env || "prod";
+  [...$("#envSeg").children].forEach((x) => x.classList.toggle("on", x.dataset.env === settings.envPick));
+  if (document.activeElement !== $("#setPort")) $("#setPort").value = st.port || 8787;
+  if (!$("#runInfo").textContent || !$("#runInfo").classList.contains("okmsg"))
+    tip("#runInfo", `当前进程：${(d.env || "").toUpperCase()} · 端口 ${d.port} · 版本 ${d.version}` +
+      (d.frozen ? " · 桌面程序" : " · 源码运行") + `\n数据目录：${d.data_dir}\n执行记录：${d.ops_log}`);
+  // ---- topbar chip ----
+  const chip = $("#whoChip");
+  chip.hidden = false;
+  const who = acc.name || st.operator_name || "";
+  if (!cred.configured) { chip.textContent = "⚠ 未配置凭据"; chip.className = "whochip bad"; }
+  else if (acc.mode === "team" && !acc.ok) { chip.textContent = "🔒 未授权"; chip.className = "whochip bad"; }
+  else { chip.textContent = (who ? "👤 " + who : "👤 未署名") + (acc.mode === "team" ? " · 已授权" : ""); chip.className = "whochip" + (who ? "" : " dim"); }
+}
+
+function applyLock(acc) {
+  settings.locked = acc && acc.mode === "team" && !acc.ok;
+  settings.lockReason = (acc && acc.reason) || "";
+  $("#lockReason").textContent = settings.lockReason || "此电脑的授权已停用或未设置";
+  refreshLockOverlay();
+}
+
+function refreshLockOverlay() {
+  const ov = $("#lockOverlay"); if (!ov) return;
+  const onSettings = !!document.querySelector('#tabs button.on[data-tab="settings"]');
+  ov.hidden = !(settings.locked && !onSettings);
+}
+
+async function checkAccess(force) {
+  try {
+    const r = await api("/api/access/status" + (force ? "?force=1" : ""));
+    if (!r.ok) return;
+    applySettings({ access: r.access });
+    if (force) tip("#accessResult", r.access.ok ? "✓ 授权有效" + (r.access.name ? "：" + r.access.name : "")
+      : "✗ " + (r.access.reason || "未授权"), r.access.ok ? "ok" : "bad");
+  } catch (e) { /* offline: keep current state */ }
+}
+
+async function testCredentials() {
+  const btn = $("#credTestBtn"); btn.disabled = true; btn.textContent = "测试中…";
+  const body = $("#setAppSecret").value ? { app_id: $("#setAppId").value.trim(), app_secret: $("#setAppSecret").value } : {};
+  try {
+    const r = await api("/api/settings/test", body);
+    const t = r.test || {};
+    tip("#credResult", t.ok ? `✓ 连接成功：${t.app_id} · 可访问 Base（${t.tables} 张表）· ${t.ms} ms · ${t.host}`
+      : "✗ " + (t.error || r.error || "失败"), t.ok ? "ok" : "bad");
+  } catch (e) { tip("#credResult", "✗ " + e.message, "bad"); }
+  btn.disabled = false; btn.textContent = "测试连接";
+}
+
+async function saveCredentials() {
+  const id = $("#setAppId").value.trim(), sec = $("#setAppSecret").value;
+  if (!id || !sec) return tip("#credResult", "请填写 App ID 和 App Secret", "bad");
+  const btn = $("#credSaveBtn"); btn.disabled = true; btn.textContent = "验证中…";
+  try {
+    const r = await api("/api/settings/credentials", { app_id: id, app_secret: sec });
+    if (!r.ok) { tip("#credResult", "✗ 未保存：" + (r.error || "失败"), "bad"); }
+    else {
+      $("#setAppSecret").value = "";
+      $("#credPanel").classList.remove("attention");
+      tip("#credResult", `✓ 已验证并保存（Base 可访问，${r.test.tables} 张表）— 立即生效`, "ok");
+      await loadSettings();
+      bootSync();                       // meta needs credentials
+    }
+  } catch (e) { tip("#credResult", "✗ " + e.message, "bad"); }
+  btn.disabled = false; btn.textContent = "验证并保存";
+}
+
+async function clearCredentials() {
+  if (!confirm("清除本机加密保存的 App ID / App Secret？\n\n之后本机将无法访问飞书，直到重新填写。")) return;
+  const r = await api("/api/settings/credentials/clear", {});
+  if (r.ok) { $("#setAppId").value = ""; tip("#credStatus", "", null); tip("#credResult", "已清除本机凭据", "ok"); await loadSettings(); }
+}
+
+async function saveAccessKey() {
+  const key = $("#setAccessKey").value.trim();
+  if (!key) return tip("#accessResult", "请输入授权码", "bad");
+  const r = await api("/api/settings", { access_key: key });
+  if (!r.ok) return tip("#accessResult", "⚠ " + r.error, "bad");
+  $("#setAccessKey").value = "";
+  applySettings(r);
+  const acc = r.access || {};
+  tip("#accessResult", acc.mode === "single" ? "✓ 已保存（当前为单机模式，未校验）"
+    : acc.ok ? `✓ 授权有效：${acc.name || ""}` : "✗ " + (acc.reason || "未授权"),
+    acc.mode === "single" || acc.ok ? "ok" : "bad");
+}
+
+async function createAuthTable() {
+  const name = prompt("将在当前 Base 中新建一张授权表（字段：授权码 / 姓名 / 状态 / 到期 / 备注 / 最近使用）。\n\n" +
+    "这是对生产 Base 的一次写入（只新增一张表，不动现有表）。\n\n表名：", "LarkTunnel 授权表");
+  if (name === null) return;
+  const r = await api("/api/access/create_table", { confirm: true, name });
+  if (!r.ok) return tip("#accessResult", "⚠ " + r.error, "bad");
+  applySettings(r);
+  tip("#accessResult", `✓ 已创建授权表 ${r.table} 并保存。现在为自己签发一枚授权码并填入上方，否则本机也会被锁定。`, "ok");
+  loadMembers();
+}
+
+async function issueKey() {
+  const name = $("#issueName").value.trim();
+  if (!name) return tip("#issueResult", "请填写成员姓名", "bad");
+  const r = await api("/api/access/issue", { name, note: $("#issueNote").value.trim(), expiry: $("#issueExpiry").value.trim() });
+  if (!r.ok) return tip("#issueResult", "⚠ " + r.error, "bad");
+  const out = $("#issueResult"); out.innerHTML = ""; out.className = "tip okmsg";
+  out.append(el("span", {}, `✓ 已为「${r.name}」签发授权码（只显示这一次，请立即交给本人）： `),
+    el("code", { class: "keycode" }, r.key), " ",
+    (() => { const b = el("button", { class: "mini" }, "复制"); b.addEventListener("click", () => { navigator.clipboard.writeText(r.key); b.textContent = "已复制"; }); return b; })());
+  $("#issueName").value = ""; $("#issueNote").value = ""; $("#issueExpiry").value = "";
+  loadMembers();
+}
+
+async function loadMembers() {
+  const out = $("#membersOut");
+  if (!(settings.data && settings.data.settings && settings.data.settings.auth_table)) {
+    out.innerHTML = ""; out.append(el("div", { class: "tip" }, "未配置授权表")); return;
+  }
+  out.innerHTML = ""; out.append(el("div", { class: "tip" }, "加载中…"));
+  let r;
+  try { r = await api("/api/access/members"); } catch (e) { r = { ok: false, error: e.message }; }
+  out.innerHTML = "";
+  if (!r.ok) return out.append(el("div", { class: "tip badmsg" }, "⚠ " + r.error));
+  if (!r.members.length) return out.append(el("div", { class: "tip" }, "授权表为空 — 先签发授权码"));
+  const tbl = el("table", { class: "members" });
+  tbl.append(el("thead", {}, el("tr", {}, ...["姓名", "状态", "授权码", "到期", "备注", "最近使用", ""].map((h) => el("th", {}, h)))));
+  const tb = el("tbody");
+  for (const m of r.members) {
+    const on = m.status === "启用";
+    const btn = el("button", { class: "mini" + (on ? " off" : "") }, on ? "停用" : "启用");
+    btn.addEventListener("click", async () => {
+      if (on && !confirm(`停用「${m.name || m.key}」？其电脑上的工具将在几分钟内锁定，服务端拒绝一切读写。`)) return;
+      btn.disabled = true;
+      const rr = await api("/api/access/set_status", { record_id: m.record_id, active: !on });
+      if (!rr.ok) { alert(rr.error); btn.disabled = false; return; }
+      loadMembers(); checkAccess(true);
+    });
+    tb.append(el("tr", { class: on ? "" : "rowoff" },
+      el("td", {}, m.name || "—"),
+      el("td", {}, el("span", { class: "chip " + (on ? "ok" : "bad") }, m.status || "—")),
+      el("td", {}, el("code", {}, (m.key || "").slice(0, 6) + "…")),
+      el("td", {}, m.expiry || "—"), el("td", {}, m.note || "—"), el("td", {}, m.seen || "—"),
+      el("td", {}, btn)));
+  }
+  tbl.append(tb);
+  out.append(el("div", { class: "tablewrap" }, tbl));
+}
+
+async function loadOps() {
+  const out = $("#opsOut"); out.innerHTML = "";
+  let r;
+  try { r = await api("/api/ops/log?n=40"); } catch (e) { r = { ok: false }; }
+  if (!r.ok || !r.entries.length) return out.append(el("div", { class: "tip" }, "暂无记录"));
+  const FLOW = { sync: "② 计划同步", create56: "① 新建预约", import: "📦 库存导入" };
+  const tbl = el("table", { class: "members" });
+  tbl.append(el("thead", {}, el("tr", {}, ...["时间", "操作人", "流程", "环境", "仓库", "结果", "耗时"].map((h) => el("th", {}, h)))));
+  const tb = el("tbody");
+  for (const e2 of r.entries) {
+    const s = e2.summary || {};
+    const res = "summary" in e2 && "approved" in s
+      ? `执行 ${s.done}/${s.approved} · 核实 ${s.verified}` + (s.failed ? ` · 失败 ${s.failed}` : "") + (s.skipped ? ` · 跳过 ${s.skipped}` : "")
+      : JSON.stringify(s);
+    tb.append(el("tr", {}, el("td", {}, e2.when), el("td", {}, e2.operator || "—"), el("td", {}, FLOW[e2.flow] || e2.flow),
+      el("td", {}, (e2.env || "").toUpperCase()), el("td", {}, e2.warehouse || "—"), el("td", {}, res), el("td", {}, e2.elapsed + " s")));
+  }
+  tbl.append(tb);
+  out.append(el("div", { class: "tablewrap" }, tbl));
 }
 
 boot();

@@ -33,3 +33,8 @@ logs/
 
 # machine-written operator alias map
 config/operators-auto.json
+
+# Desktop build (PyInstaller) + build venv
+.venv-build/
+webapp/build/
+webapp/dist/

@@ -346,3 +346,56 @@ tr.detail > td{background-color:var(--soft); padding:0}
 .helpbox .ex code{flex:1 1 auto; overflow-x:auto; white-space:nowrap}
 .helpbox .ex .exnote{flex:0 0 auto; color:var(--muted); font-size:12px}
 .helpbox .hbnote{color:var(--muted); font-size:12px; margin-top:6px}
+
+/* ---- ⚙ 设置 · lock overlay · operator chip ---- */
+.tabs button.tabright{margin-left:auto}
+.whochip{
+  height:28px; padding:0 12px; border:1px solid rgba(255,255,255,.28); border-radius:999px;
+  background-color:rgba(255,255,255,.12); color:#fff; font:600 12px/1 inherit; cursor:pointer;
+  white-space:nowrap; max-width:260px; overflow:hidden; text-overflow:ellipsis;
+}
+.whochip:hover{background-color:rgba(255,255,255,.22); border-color:rgba(255,255,255,.45)}
+.whochip.bad{background-color:rgba(229,72,77,.85); border-color:rgba(255,255,255,.4)}
+.whochip.dim{opacity:.8}
+.settings .stephead{align-items:flex-start; flex-wrap:wrap}
+.settings .stephead .stepnote{flex:1 1 100%; line-height:1.6}
+.settings .stepnote b{color:var(--ink)}
+.settings + .settings{margin-top:0}
+.settings.attention{border-color:var(--warn-line); box-shadow:0 0 0 3px var(--warn-bg)}
+.tip.okmsg{color:var(--ok); font-weight:600; white-space:pre-line}
+.tip.badmsg{color:var(--bad); font-weight:600; white-space:pre-line}
+.tip.runinfo{white-space:pre-line; font-family:ui-monospace,Consolas,monospace; font-size:12px}
+input[type=password]{
+  height:38px; padding:0 10px; border:1px solid var(--line); border-radius:8px;
+  background-color:var(--input-bg); color:var(--ink); font-size:14px; outline:none; width:100%;
+}
+input[type=password]:focus{border-color:var(--brand-soft); box-shadow:0 0 0 3px var(--focus)}
+button.primary.ghost{background-color:transparent; color:var(--brand-soft); border:1px solid var(--brand-soft)}
+button.primary.ghost:hover{background-color:var(--brand-tint)}
+button.mini{
+  height:28px; padding:0 12px; border:1px solid var(--line); border-radius:6px; cursor:pointer;
+  background-color:var(--panel); color:var(--ink); font-size:12px; font-weight:600;
+}
+button.mini:hover{background-color:var(--chip)}
+button.mini.off{color:var(--bad); border-color:var(--bad)}
+button.mini:disabled{opacity:.5; cursor:not-allowed}
+.keycode{
+  font-family:ui-monospace,Consolas,monospace; font-size:13px; padding:3px 8px; border-radius:6px;
+  background-color:var(--panel); border:1px solid var(--line); user-select:all;
+}
+.membersout{margin-top:10px}
+table.members{min-width:0; font-size:12.5px}
+table.members td{white-space:normal}
+table.members tr.rowoff td{color:var(--muted)}
+.lockoverlay[hidden]{display:none}   /* author display:flex would beat the hidden attribute */
+.lockoverlay{
+  position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center;
+  background-color:rgba(10,14,20,.55); backdrop-filter:blur(3px);
+}
+.lockcard{
+  background-color:var(--panel); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow-lg);
+  padding:28px 32px; max-width:520px; text-align:center; display:flex; flex-direction:column; gap:12px; align-items:center;
+}
+.lockicon{font-size:40px}
+.lockcard b{font-size:16px}
+.lockreason{color:var(--muted); font-size:13px; line-height:1.6}

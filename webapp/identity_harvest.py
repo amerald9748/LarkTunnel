@@ -29,7 +29,8 @@ import time
 import lark_client as lark
 import audit_store
 
-AUTO_PATH = os.path.join(lark.ROOT, "config", "operators-auto.json")
+import apppaths
+AUTO_PATH = apppaths.state_path("config", "operators-auto.json")
 
 PER_TABLE_DEFAULT = 400          # newest N records per table per sweep
 PAGE_SIZE = 200

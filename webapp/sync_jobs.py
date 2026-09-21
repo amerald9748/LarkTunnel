@@ -47,8 +47,10 @@ def _snapshot(job, with_result):
     return out
 
 
-def start(kind, runner):
-    """Spawn `runner(progress)` in a daemon thread. Returns the job snapshot."""
+def start(kind, runner, on_done=None):
+    """Spawn `runner(progress)` in a daemon thread. Returns the job snapshot.
+    `on_done(job_id, result, elapsed)` (optional) runs after a SUCCESSFUL
+    finish — used for the local ops log; its errors are swallowed."""
     with _LOCK:
         if kind == "commit":
             for j in _JOBS.values():
@@ -87,6 +89,11 @@ def start(kind, runner):
                 job["result"] = res
                 job["state"] = "done"
                 job["stage"] = "完成"
+            if on_done:
+                try:
+                    on_done(job["id"], res, time.time() - job["started"])
+                except Exception:      # logging must never fail the job
+                    pass
         except Exception as e:  # noqa — surfaced to the poller, never lost
             with _LOCK:
                 job["error"] = str(e)

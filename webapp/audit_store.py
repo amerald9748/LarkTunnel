@@ -28,9 +28,10 @@ import time
 import sqlite3
 import threading
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # LarkTunnel/
-DB_PATH = os.environ.get("LARK_AUDIT_DB",
-                         os.path.join(ROOT, "logs", "audit.db"))
+import apppaths
+ROOT = apppaths.repo_root()  # LarkTunnel/
+# logs/audit.db in the checkout; %APPDATA%\LarkTunnel\logs when frozen
+DB_PATH = os.environ.get("LARK_AUDIT_DB") or apppaths.state_path("logs", "audit.db")
 
 _lock = threading.Lock()
 

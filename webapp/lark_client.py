@@ -57,7 +57,8 @@ except Exception:
     TZ = datetime.timezone(datetime.timedelta(hours=-6))
     _TZ_NAME = "UTC-6"
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # LarkTunnel/
+import apppaths
+ROOT = apppaths.bundle_root()   # LarkTunnel/ checkout, or the frozen bundle
 HOSTS = ["https://open.feishu.cn", "https://open.larksuite.com"]    # China first, then intl
 
 DATE_TYPES = {5, 1001, 1002}  # datetime, created-time, modified-time
@@ -149,34 +150,13 @@ def table_id(label):
 
 
 def _load_creds():
-    raw = _read(os.path.join(ROOT, "config", "secrets.txt"))
-    app_id = None
-    m = re.search(r"\bcli_[A-Za-z0-9]+", raw)  # Feishu app ids look like cli_xxx
-    if m:
-        app_id = m.group(0)
-    kv = {}
-    for line in raw.splitlines():
-        mm = re.match(r"\s*[\"']?([A-Za-z0-9_\- ]+?)[\"']?\s*[:=]\s*[\"']?([^\"',#]+)", line)
-        if mm:
-            kv[mm.group(1).strip().lower().replace(" ", "_")] = mm.group(2).strip()
-    if not app_id:
-        for k in ("app_id", "appid", "app_key", "id"):
-            if k in kv:
-                app_id = kv[k]
-                break
-    app_secret = None
-    for k in ("app_secret", "appsecret", "secret", "app_secret_key"):
-        if k in kv:
-            app_secret = kv[k]
-            break
-    if not app_secret:
-        cands = [c for c in re.findall(r"\b[A-Za-z0-9]{20,}\b", raw)
-                 if c != app_id and not c.startswith("cli_")]
-        if cands:
-            app_secret = cands[0]
-    if not app_id or not app_secret:
-        raise LarkError("Could not parse App ID / Secret from config/secrets.txt")
-    return app_id, app_secret
+    """App ID / Secret via app_settings: the ⚙ 设置 DPAPI store first, then
+    LARK_APP_ID/LARK_APP_SECRET, then the legacy config/secrets.txt."""
+    import app_settings
+    try:
+        return app_settings.get_credentials()
+    except app_settings.NoCredentials as e:
+        raise LarkError(str(e), code="nocreds")
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +165,13 @@ def _load_creds():
 
 _lock = threading.Lock()
 _token = {"host": None, "value": None, "exp": 0}
+
+
+def invalidate_token():
+    """Drop the cached tenant token — called when credentials change so the
+    next call authenticates with the NEW App Secret immediately."""
+    with _lock:
+        _token.update(host=None, value=None, exp=0)
 
 
 def _http(method, url, headers=None, payload=None, timeout=30):
@@ -233,6 +220,9 @@ def _get_token():
 # Read-only endpoints (searches are POSTs, so method alone can't tell): these
 # are safe to retry after a transient network fault.
 _READ_SUFFIXES = ("/records/search", "/records/batch_get", "/fields", "/views")
+# Feishu frequency-limit codes (HTTP 429 arrives as code=429 from _http, the
+# body codes when the gateway answers 200) — always safe to retry after a pause.
+_RATE_LIMIT_CODES = {429, 1254290, 1254291, 99991400, 99991403}
 
 
 def _api(method, path, payload=None, query=None):
@@ -262,12 +252,17 @@ def _api(method, path, payload=None, query=None):
             # "get app user failed" seen live 2026-08-14) — safe to retry for
             # reads / token-carrying writes
             transient = (e.code == "net"
+                         or e.code in _RATE_LIMIT_CODES
                          or (isinstance(e.code, int) and e.code >= 500))
             if transient and i < attempts - 1:
                 last = e
                 continue
             raise
         if r.get("code") != 0:
+            if r.get("code") in _RATE_LIMIT_CODES and i < attempts - 1:
+                last = LarkError(f"Feishu 限频 (code {r.get('code')})", code=r.get("code"))
+                time.sleep(0.5)          # plus the loop's 1s/2s backoff
+                continue
             raise LarkError(f"Feishu API error code {r.get('code')}: {r.get('msg')}",
                             code=r.get("code"))
         return r.get("data", {})
