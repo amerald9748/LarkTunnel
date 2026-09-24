@@ -2268,6 +2268,8 @@ function tip(sel, text, kind) {
 function initSettings() {
   $("#whoChip").addEventListener("click", () => switchTab("settings"));
   $("#lockSettingsBtn").addEventListener("click", () => switchTab("settings"));
+  $("#lockLoginBtn").addEventListener("click", lockLogin);
+  $("#lockKey").addEventListener("keydown", (e) => { if (e.key === "Enter") lockLogin(); });
   $("#credTestBtn").addEventListener("click", testCredentials);
   $("#credSaveBtn").addEventListener("click", saveCredentials);
   $("#credClearBtn").addEventListener("click", clearCredentials);
@@ -2283,6 +2285,7 @@ function initSettings() {
     applySettings(r); tip("#accessResult", "✓ 授权表已保存", "ok"); loadMembers();
   });
   $("#authTableCreateBtn").addEventListener("click", createAuthTable);
+  $("#authUpgradeBtn").addEventListener("click", upgradeAuthTable);
   $("#issueBtn").addEventListener("click", issueKey);
   $("#membersBtn").addEventListener("click", loadMembers);
   $("#ownerBox").addEventListener("toggle", (e) => { if (e.target.open) loadMembers(); });
@@ -2314,7 +2317,9 @@ async function loadSettings() {
   if (!r.ok) return;
   applySettings(r);
   if (!r.credentials.configured) {
+    // only ever true on an admin/source machine: distributed builds carry credentials
     switchTab("settings");
+    $("#credPanel").hidden = false;
     $("#credPanel").classList.add("attention");
     tip("#credStatus", "尚未配置飞书应用凭据 — 请填写 App ID / App Secret 后「验证并保存」", "bad");
   }
@@ -2327,7 +2332,8 @@ function applySettings(r) {
   const acc = d.access || {};
   // ---- credentials ----
   if (cred.configured) {
-    const src = { dpapi: "本机加密存储", env: "环境变量", legacy: "config/secrets.txt（旧方式）" }[cred.source] || cred.source;
+    const src = { dpapi: "本机加密存储", env: "环境变量", bundled: "程序内置（打包时写入）",
+      legacy: "config/secrets.txt（旧方式）" }[cred.source] || cred.source;
     tip("#credStatus", `✓ 已配置：${cred.app_id} · 密钥 ${cred.secret_hint} · 来源：${src}`, "ok");
     if (!$("#setAppId").value) $("#setAppId").value = cred.app_id || "";
   } else if (!$("#credStatus").textContent) {
@@ -2345,6 +2351,15 @@ function applySettings(r) {
     : "单机模式 — 未配置授权表，不校验授权码（管理员可在下方创建授权表启用团队模式）",
     acc.mode === "team" ? (acc.ok ? "ok" : "bad") : null);
   applyLock(acc);
+  applyPerms(acc);
+  // ---- auth table provenance (baked config vs local override) ----
+  const src = d.auth_table_source;
+  tip("#authTableNote", src === "config"
+    ? `授权表来自 config.js（打包固化）：${d.auth_table}` + (d.frozen ? "" : " — 本地设置可覆盖，仅限源码运行")
+    : src === "settings" ? `授权表来自本机设置：${d.auth_table}（打包前请写入 config.js authTable）`
+    : "未配置授权表 — 单机模式");
+  $("#authUpgradeBtn").hidden = !(acc.mode === "team" && acc.role_field === false);
+  if (d.frozen) { $("#setAuthTable").disabled = true; $("#authTableSaveBtn").disabled = true; }
   // ---- runtime ----
   settings.envPick = st.env || "prod";
   [...$("#envSeg").children].forEach((x) => x.classList.toggle("on", x.dataset.env === settings.envPick));
@@ -2358,7 +2373,32 @@ function applySettings(r) {
   const who = acc.name || st.operator_name || "";
   if (!cred.configured) { chip.textContent = "⚠ 未配置凭据"; chip.className = "whochip bad"; }
   else if (acc.mode === "team" && !acc.ok) { chip.textContent = "🔒 未授权"; chip.className = "whochip bad"; }
-  else { chip.textContent = (who ? "👤 " + who : "👤 未署名") + (acc.mode === "team" ? " · 已授权" : ""); chip.className = "whochip" + (who ? "" : " dim"); }
+  else { chip.textContent = (who ? "👤 " + who : "👤 未署名") + (acc.mode === "team" ? ` · ${acc.role || "已授权"}` : ""); chip.className = "whochip" + (who ? "" : " dim"); }
+}
+
+// feature -> nav tab. Hidden tabs are courtesy; the server refuses the routes.
+const FEATURE_TAB = { import: "import", create: "create", sync: "sync", verify: "verify",
+  audit: "audit", query: "query", parse: "upload" };
+
+function applyPerms(acc) {
+  const perms = (acc && acc.mode === "team" && acc.ok) ? (acc.perms || []) : Object.keys(FEATURE_TAB).concat("admin");
+  const isAdmin = perms.includes("admin");
+  let activeHidden = false;
+  for (const b of $("#tabs").children) {
+    const feat = Object.keys(FEATURE_TAB).find((f) => FEATURE_TAB[f] === b.dataset.tab);
+    if (!feat) continue;                         // ⚙ 设置 always visible
+    const hide = !perms.includes(feat);
+    b.hidden = hide;
+    if (hide && b.classList.contains("on")) activeHidden = true;
+  }
+  if (activeHidden) {
+    const first = [...$("#tabs").children].find((b) => !b.hidden && b.dataset.tab !== "settings");
+    if (first) first.click();
+  }
+  $("#ownerBox").hidden = !isAdmin;
+  $("#runPanel").hidden = !isAdmin;
+  // credentials are the admin's business (members run a build that carries them)
+  $("#credPanel").hidden = !isAdmin;
 }
 
 function applyLock(acc) {
@@ -2420,6 +2460,27 @@ async function clearCredentials() {
   if (r.ok) { $("#setAppId").value = ""; tip("#credStatus", "", null); tip("#credResult", "已清除本机凭据", "ok"); await loadSettings(); }
 }
 
+async function lockLogin() {
+  const key = $("#lockKey").value.trim();
+  if (!key) return tip("#lockResult", "请输入授权码", "bad");
+  const btn = $("#lockLoginBtn"); btn.disabled = true; btn.textContent = "验证中…";
+  try {
+    const r = await api("/api/settings", { access_key: key });
+    if (!r.ok) throw new Error(r.error || "失败");
+    const acc = r.access || {};
+    if (acc.ok) {
+      $("#lockKey").value = "";
+      tip("#lockResult", `✓ 欢迎，${acc.name || ""}（${acc.role || "已授权"}）`, "ok");
+      applySettings(r);
+      bootSync();                       // meta may have been refused while locked
+    } else {
+      tip("#lockResult", "✗ " + (acc.reason || "授权无效"), "bad");
+      applySettings(r);
+    }
+  } catch (e) { tip("#lockResult", "✗ " + e.message, "bad"); }
+  btn.disabled = false; btn.textContent = "登录";
+}
+
 async function saveAccessKey() {
   const key = $("#setAccessKey").value.trim();
   if (!key) return tip("#accessResult", "请输入授权码", "bad");
@@ -2447,10 +2508,11 @@ async function createAuthTable() {
 async function issueKey() {
   const name = $("#issueName").value.trim();
   if (!name) return tip("#issueResult", "请填写成员姓名", "bad");
-  const r = await api("/api/access/issue", { name, note: $("#issueNote").value.trim(), expiry: $("#issueExpiry").value.trim() });
+  const r = await api("/api/access/issue", { name, note: $("#issueNote").value.trim(), expiry: $("#issueExpiry").value.trim(),
+    role: $("#issueRole").value });
   if (!r.ok) return tip("#issueResult", "⚠ " + r.error, "bad");
   const out = $("#issueResult"); out.innerHTML = ""; out.className = "tip okmsg";
-  out.append(el("span", {}, `✓ 已为「${r.name}」签发授权码（只显示这一次，请立即交给本人）： `),
+  out.append(el("span", {}, `✓ 已为「${r.name}」签发 ${r.role || ""} 授权码（只显示这一次，请立即交给本人）： `),
     el("code", { class: "keycode" }, r.key), " ",
     (() => { const b = el("button", { class: "mini" }, "复制"); b.addEventListener("click", () => { navigator.clipboard.writeText(r.key); b.textContent = "已复制"; }); return b; })());
   $("#issueName").value = ""; $("#issueNote").value = ""; $("#issueExpiry").value = "";
@@ -2469,10 +2531,22 @@ async function loadMembers() {
   if (!r.ok) return out.append(el("div", { class: "tip badmsg" }, "⚠ " + r.error));
   if (!r.members.length) return out.append(el("div", { class: "tip" }, "授权表为空 — 先签发授权码"));
   const tbl = el("table", { class: "members" });
-  tbl.append(el("thead", {}, el("tr", {}, ...["姓名", "状态", "授权码", "到期", "备注", "最近使用", ""].map((h) => el("th", {}, h)))));
+  tbl.append(el("thead", {}, el("tr", {}, ...["姓名", "状态", "角色", "授权码", "到期", "备注", "最近使用", ""].map((h) => el("th", {}, h)))));
   const tb = el("tbody");
   for (const m of r.members) {
     const on = m.status === "启用";
+    const isAdmin = m.role === "管理员";
+    const roleBtn = el("button", { class: "mini", title: r.role_field === false ? "先升级授权表" : "切换角色",
+      disabled: r.role_field === false ? "disabled" : undefined },
+      r.role_field === false ? "管理员（旧表）" : (m.role || "成员") + " ⇄");
+    roleBtn.addEventListener("click", async () => {
+      const next = isAdmin ? "成员" : "管理员";
+      if (!confirm(`把「${m.name || m.key}」的角色改为「${next}」？`)) return;
+      roleBtn.disabled = true;
+      const rr = await api("/api/access/set_role", { record_id: m.record_id, role: next });
+      if (!rr.ok) { alert(rr.error); roleBtn.disabled = false; return; }
+      loadMembers(); checkAccess(true);
+    });
     const btn = el("button", { class: "mini" + (on ? " off" : "") }, on ? "停用" : "启用");
     btn.addEventListener("click", async () => {
       if (on && !confirm(`停用「${m.name || m.key}」？其电脑上的工具将在几分钟内锁定，服务端拒绝一切读写。`)) return;
@@ -2484,12 +2558,24 @@ async function loadMembers() {
     tb.append(el("tr", { class: on ? "" : "rowoff" },
       el("td", {}, m.name || "—"),
       el("td", {}, el("span", { class: "chip " + (on ? "ok" : "bad") }, m.status || "—")),
+      el("td", {}, roleBtn),
       el("td", {}, el("code", {}, (m.key || "").slice(0, 6) + "…")),
       el("td", {}, m.expiry || "—"), el("td", {}, m.note || "—"), el("td", {}, m.seen || "—"),
       el("td", {}, btn)));
   }
   tbl.append(tb);
   out.append(el("div", { class: "tablewrap" }, tbl));
+}
+
+async function upgradeAuthTable() {
+  if (!confirm("为授权表添加「角色」字段（管理员 / 成员），并把当前授权码对应的成员设为管理员？\n\n" +
+    "这是对 Base 中授权表结构的一次修改（只加一列，不动其他表）。之后未设置角色的成员默认为「成员」。")) return;
+  const r = await api("/api/access/upgrade", { confirm: true });
+  if (!r.ok) return tip("#accessResult", "⚠ " + r.error, "bad");
+  applySettings({ access: r.access });
+  tip("#accessResult", `✓ 授权表已升级${r.field_added ? "（已添加角色字段）" : "（角色字段已存在）"}` +
+    (r.self_admin ? "，你已是管理员" : "，未找到你的授权码对应行 — 请在成员列表手动设为管理员"), "ok");
+  loadMembers();
 }
 
 async function loadOps() {

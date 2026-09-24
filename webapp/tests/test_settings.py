@@ -28,9 +28,13 @@ class TempHome(unittest.TestCase):
         self._legacy = mock.patch.object(app_settings, "LEGACY_SECRETS",
                                          lambda: os.path.join(self.home, "nope.txt"))
         self._legacy.start()
+        self.bundle_path = os.path.join(self.home, "bundle", "bundled.bin")
+        self._bundle = mock.patch.object(app_settings, "BUNDLED_SECRETS", lambda: self.bundle_path)
+        self._bundle.start()
 
     def tearDown(self):
         self._legacy.stop()
+        self._bundle.stop()
         os.environ.clear()
         os.environ.update(self._env)
         shutil.rmtree(self.home, ignore_errors=True)
@@ -129,6 +133,49 @@ class TestCredentials(TempHome):
         with open(app_settings.SECRETS_PATH(), "wb") as f:
             f.write(b"DPAPI1" + b"\x00garbage")
         self.assertEqual(app_settings.resolve_credentials()[2], None)
+
+
+class TestBundledCredentials(TempHome):
+    def test_bundle_roundtrip_and_obfuscation(self):
+        app_settings.write_bundle(self.bundle_path, "cli_bundle0001", "B" * 32)
+        with open(self.bundle_path, "rb") as f:
+            raw = f.read()
+        self.assertTrue(raw.startswith(b"LTB1"))
+        self.assertNotIn(b"cli_bundle0001", raw)
+        self.assertNotIn(b"B" * 32, raw)
+        self.assertEqual(app_settings.read_bundle(self.bundle_path), ("cli_bundle0001", "B" * 32))
+
+    def test_bundle_is_used_when_nothing_else_configured(self):
+        app_settings.write_bundle(self.bundle_path, "cli_bundle0001", "B" * 32)
+        a, s, src = app_settings.resolve_credentials()
+        self.assertEqual((a, src), ("cli_bundle0001", "bundled"))
+        st = app_settings.credential_status()
+        self.assertTrue(st["bundled"])
+        self.assertEqual(st["source"], "bundled")
+
+    def test_dpapi_and_env_override_bundle(self):
+        app_settings.write_bundle(self.bundle_path, "cli_bundle0001", "B" * 32)
+        os.environ["LARK_APP_ID"], os.environ["LARK_APP_SECRET"] = "cli_envenvenv", "E" * 32
+        self.assertEqual(app_settings.resolve_credentials()[2], "env")
+        app_settings.save_credentials("cli_dpapidpapi", "D" * 32)
+        self.assertEqual(app_settings.resolve_credentials()[2], "dpapi")
+
+    def test_bundle_before_legacy(self):
+        app_settings.write_bundle(self.bundle_path, "cli_bundle0001", "B" * 32)
+        self._legacy.stop()
+        legacy = os.path.join(self.home, "secrets.txt")
+        with open(legacy, "w", encoding="utf-8") as f:
+            f.write("AppId: cli_legacy9999\nAppSecret: LEGACYSECRETLEGACYSECRET12\n")
+        self._legacy = mock.patch.object(app_settings, "LEGACY_SECRETS", lambda: legacy)
+        self._legacy.start()
+        self.assertEqual(app_settings.resolve_credentials()[2], "bundled")
+
+    def test_corrupt_bundle_ignored(self):
+        os.makedirs(os.path.dirname(self.bundle_path), exist_ok=True)
+        with open(self.bundle_path, "wb") as f:
+            f.write(b"LTB1garbage")
+        self.assertIsNone(app_settings.read_bundle(self.bundle_path))
+        self.assertFalse(app_settings.credential_status()["bundled"])
 
 
 if __name__ == "__main__":

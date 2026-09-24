@@ -38,3 +38,4 @@ config/operators-auto.json
 .venv-build/
 webapp/build/
 webapp/dist/
+webapp/dist_staging/

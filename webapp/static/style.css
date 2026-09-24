@@ -399,3 +399,9 @@ table.members tr.rowoff td{color:var(--muted)}
 .lockicon{font-size:40px}
 .lockcard b{font-size:16px}
 .lockreason{color:var(--muted); font-size:13px; line-height:1.6}
+select#issueRole{min-width:190px}
+.tabs button[hidden]{display:none}
+.lockform{display:flex; gap:8px; width:100%; max-width:420px}
+.lockform input{flex:1}
+.lockcard .tip{min-height:18px; margin:0}
+.lockcard button.mini{margin-top:4px}

@@ -53,9 +53,14 @@
   <div id="lockOverlay" class="lockoverlay" hidden>
     <div class="lockcard">
       <div class="lockicon">🔒</div>
-      <b>工具已锁定</b>
+      <b>请输入授权码登录</b>
       <div id="lockReason" class="lockreason">—</div>
-      <button id="lockSettingsBtn" class="primary" type="button">打开 ⚙ 设置</button>
+      <div class="lockform">
+        <input type="password" id="lockKey" placeholder="LT-…（由管理员签发）" autocomplete="off" />
+        <button id="lockLoginBtn" class="primary" type="button">登录</button>
+      </div>
+      <div id="lockResult" class="tip"></div>
+      <button id="lockSettingsBtn" class="mini" type="button">打开 ⚙ 设置</button>
     </div>
   </div>
 
@@ -448,7 +453,8 @@ ZCSU9034790B&#9;YVR4&#9;1&#9;14&#9;7404870996&#9;08/03/2026 13:00 PDT"></textare
         </div>
         <div id="credResult" class="tip"></div>
         <div class="ownnote">切换凭据：飞书开放平台重置 App Secret 后，在这里填新密钥「验证并保存」即可，
-          无需重启；旧密钥在所有电脑上立即失效。</div>
+          无需重启；旧密钥在所有电脑上立即失效。<b>分发给成员的 exe 内置凭据</b>（build.bat 打包时写入），
+          成员看不到本区块、也不能修改凭据；重置密钥后需重新打包分发。</div>
       </section>
 
       <section class="panel controls settings">
@@ -483,11 +489,22 @@ ZCSU9034790B&#9;YVR4&#9;1&#9;14&#9;7404870996&#9;08/03/2026 13:00 PDT"></textare
                 <input type="text" id="setAuthTable" placeholder="tbl…" spellcheck="false" /></label>
               <div class="fld go"><span>&nbsp;</span><button id="authTableSaveBtn" class="primary" type="button">保存</button></div>
               <div class="fld go"><span>&nbsp;</span><button id="authTableCreateBtn" class="primary ghost" type="button">在 Base 中新建授权表…</button></div>
+              <div class="fld go"><span>&nbsp;</span><button id="authUpgradeBtn" class="primary ghost" type="button" hidden title="为旧授权表添加「角色」字段，并把我设为管理员">升级授权表（添加角色）…</button></div>
             </div>
+            <div id="authTableNote" class="tip"></div>
+            <div class="ownnote"><b>角色</b>：<b>成员</b> 只看到 📦 库存导入 · ① 新建预约 · ② 计划同步 · ③ 核对
+              （以及自己的凭据/授权码）；<b>管理员</b> 拥有全部页签和本管理区。服务端按同一张表拒绝越权请求，
+              隐藏页签只是界面层。打包时 <code>config/config.js</code> 的 <code>authTable</code> 会固化进 exe，
+              成员无法通过清空设置退出团队模式。</div>
             <div class="grid">
               <label class="fld"><span>成员姓名</span><input type="text" id="issueName" /></label>
               <label class="fld"><span>备注</span><input type="text" id="issueNote" placeholder="岗位 / 电脑" /></label>
               <label class="fld"><span>到期 <em>（可选 YYYY-MM-DD）</em></span><input type="text" id="issueExpiry" /></label>
+              <label class="fld"><span>角色</span>
+                <select id="issueRole">
+                  <option value="成员" selected>成员（📦 ① ② ③）</option>
+                  <option value="管理员">管理员（全部 + 设置）</option>
+                </select></label>
               <div class="fld go"><span>&nbsp;</span><button id="issueBtn" class="primary" type="button">签发授权码</button></div>
             </div>
             <div id="issueResult" class="tip"></div>
@@ -501,7 +518,7 @@ ZCSU9034790B&#9;YVR4&#9;1&#9;14&#9;7404870996&#9;08/03/2026 13:00 PDT"></textare
         </details>
       </section>
 
-      <section class="panel controls settings">
+      <section class="panel controls settings" id="runPanel">
         <div class="stephead"><b>🖥️ 运行</b>
           <span class="stepnote">环境 / 端口保存后<b>下次启动桌面程序时生效</b>（当前进程不切换环境，避免半批写错表）。</span></div>
         <div class="grid">

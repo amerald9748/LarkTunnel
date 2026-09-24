@@ -27,6 +27,12 @@ module.exports = {
   // lark-cli identity to act as.
   actAs: 'user',
 
+  // LarkTunnel 授权表 — team access control for the desktop app
+  // (webapp/access_control.py). Baked into the build so every distributed
+  // exe is team-locked by construction; roles (管理员/成员) live in the table.
+  // Empty string = single-user mode (no gating).
+  authTable: 'tbltF7JR8xQHSCXc',
+
   // ---------------------------------------------------------------------------
   // Table registry — friendly label -> table id
   // Reference tables by label in code: base.tableByLabel('3.1')

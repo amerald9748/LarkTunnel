@@ -72,11 +72,54 @@ def last_ping():
 
 
 # POST routes that must work while the tool is LOCKED (no credentials yet,
-# or this person's 授权 was switched off) — everything the ⚙ 设置 page needs.
+# or this person's 授权 was switched off) — ONLY what ⚙ 设置 needs to enter
+# credentials / a 授权码. Everything else (including every /api/access/*
+# admin action) goes through the gate below.
 _OPEN_POSTS = {"/api/settings", "/api/settings/credentials",
-               "/api/settings/credentials/clear", "/api/settings/test",
-               "/api/access/create_table", "/api/access/issue",
-               "/api/access/set_status"}
+               "/api/settings/credentials/clear", "/api/settings/test"}
+
+# Route -> feature; a person's 角色 grants a set of features
+# (access_control.ROLE_PERMS). Unlisted routes need only a valid 授权.
+_FEATURE_OF = {
+    "/api/import/plan": "import", "/api/import/commit": "import",
+    "/api/create56/plan": "create", "/api/create56/commit": "create",
+    "/api/sync/plan": "sync", "/api/sync/commit": "sync",
+    "/api/verify": "verify",
+    "/api/audit/search": "audit", "/api/audit/delete": "audit",
+    "/api/audit/harvest": "audit", "/api/audit/resolve": "audit",
+    "/api/audit/status": "audit",
+    "/api/query": "query", "/api/views": "query",
+    "/api/parse": "parse",
+    "/api/access/create_table": "admin", "/api/access/issue": "admin",
+    "/api/access/set_status": "admin", "/api/access/set_role": "admin",
+    "/api/access/upgrade": "admin", "/api/access/members": "admin",
+}
+
+
+_CRED_ROUTES = {"/api/settings/credentials", "/api/settings/credentials/clear",
+                "/api/settings/test"}
+
+
+def _cred_routes_allowed():
+    """Members never touch credentials (the build carries them). Allowed when
+    NO credentials exist anywhere (first setup on a source checkout), or in
+    single mode, or for an admin."""
+    if not app_settings.credential_status()["configured"]:
+        return True
+    acc = access_control.status()
+    return acc.get("mode") == "single" or "admin" in (acc.get("perms") or [])
+
+
+def _gate(path):
+    """None when allowed, else the JSON error body to send."""
+    acc = access_control.status()
+    if not acc.get("ok"):
+        return {"ok": False, "locked": True, "error": acc.get("reason") or "未授权"}
+    feat = _FEATURE_OF.get(path)
+    if feat and feat not in (acc.get("perms") or []):
+        return {"ok": False, "forbidden": True,
+                "error": f"当前授权角色「{acc.get('role') or '成员'}」不包含此功能 — 请联系管理员"}
+    return None
 
 
 def _operator():
@@ -156,13 +199,21 @@ class Handler(BaseHTTPRequestHandler):
                     "frozen": apppaths.is_frozen(), "data_dir": apppaths.data_dir(),
                     "ops_log": ops_log.path(),
                     "base": lark.config_values().get("base_token"),
+                    "auth_table": access_control._table(),
+                    "auth_table_source": access_control.table_source(),
                     "dev_available": bool(lark.config_values().get("dev_tables"))})
             if route == "/api/access/status":
                 force = (qs.get("force") or ["0"])[0] == "1"
                 return self._send_json({"ok": True, "access": access_control.status(force=force)})
+            if route in ("/api/access/members", "/api/audit/status", "/api/views"):
+                denied = _gate(route)          # role-gated reads
+                if denied:
+                    return self._send_json(denied, 200)
             if route == "/api/access/members":
                 return self._send_json({"ok": True, "members": access_control.list_members(),
-                                        "table": app_settings.get_settings().get("auth_table")})
+                                        "table": access_control._table(),
+                                        "role_field": access_control._role_field_present(
+                                            access_control._table())})
             if route == "/api/ops/log":
                 n = int((qs.get("n") or ["50"])[0])
                 return self._send_json({"ok": True, "entries": ops_log.tail(max(1, min(n, 500)))})
@@ -520,9 +571,17 @@ class Handler(BaseHTTPRequestHandler):
         """Patch non-secret settings. env/port take effect on the next start
         of the desktop app (this process keeps its env — see lark.ENV)."""
         patch = {}
-        for k in ("operator_name", "auth_table", "env", "port", "window"):
+        acc = access_control.status()
+        admin = acc.get("mode") == "single" or "admin" in (acc.get("perms") or [])
+        # 成员 may only change what is theirs: display name + own 授权码
+        allowed = ("operator_name", "auth_table", "env", "port", "window") if admin \
+            else ("operator_name", "window")
+        for k in allowed:
             if k in payload:
                 patch[k] = payload[k]
+        if not admin and any(k in payload for k in ("auth_table", "env", "port")):
+            return self._send_json({"ok": False, "forbidden": True,
+                                    "error": "仅管理员可修改 授权表 / 环境 / 端口"}, 200)
         if "access_key" in payload and (payload["access_key"] or "").strip():
             patch["access_key"] = payload["access_key"].strip()   # blank = keep
         if payload.get("clear_access_key"):
@@ -580,8 +639,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_access_issue(self, payload):
         out = access_control.issue_key(payload.get("name") or "", payload.get("note") or "",
-                                       payload.get("expiry") or "")
+                                       payload.get("expiry") or "",
+                                       payload.get("role") or access_control.MEMBER)
         return self._send_json({"ok": True, **out})
+
+    def _handle_access_set_role(self, payload):
+        rid = payload.get("record_id")
+        if not rid:
+            return self._send_json({"ok": False, "error": "缺少 record_id"}, 200)
+        access_control.set_role(rid, payload.get("role") or "")
+        return self._send_json({"ok": True, "members": access_control.list_members(),
+                                "access": access_control.status(force=True)})
+
+    def _handle_access_upgrade(self, payload):
+        if payload.get("confirm") is not True:
+            return self._send_json({"ok": False, "error": "需要确认后才会修改授权表结构"}, 200)
+        out = access_control.upgrade_table()
+        return self._send_json({"ok": True, **out, "access": access_control.status(force=True),
+                                "members": access_control.list_members()})
 
     def _handle_access_set_status(self, payload):
         rid = payload.get("record_id")
@@ -601,7 +676,10 @@ class Handler(BaseHTTPRequestHandler):
                                "/api/import/plan", "/api/import/commit",
                                "/api/audit/search", "/api/audit/delete",
                                "/api/audit/harvest", "/api/audit/resolve",
-                               "/api/verify", *_OPEN_POSTS):
+                               "/api/verify", "/api/access/create_table",
+                               "/api/access/issue", "/api/access/set_status",
+                               "/api/access/set_role", "/api/access/upgrade",
+                               *_OPEN_POSTS):
             return self.send_error(404, "Not found")
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -613,13 +691,16 @@ class Handler(BaseHTTPRequestHandler):
 
         # ACCESS GATE — every Feishu-touching route is refused while this
         # person's 授权 is off (team mode) so a switched-off teammate cannot
-        # read or write anything, not merely lose the UI. Settings routes
-        # stay open so they can enter a new key / credentials.
+        # read or write anything, not merely lose the UI; and routes outside
+        # the person's 角色 are refused too (hidden tabs are just courtesy).
+        # Settings routes stay open so they can enter a new key / credentials.
         if parsed.path not in _OPEN_POSTS:
-            acc = access_control.status()
-            if not acc.get("ok"):
-                return self._send_json({"ok": False, "locked": True,
-                                        "error": acc.get("reason") or "未授权"}, 200)
+            denied = _gate(parsed.path)
+            if denied:
+                return self._send_json(denied, 200)
+        elif parsed.path in _CRED_ROUTES and not _cred_routes_allowed():
+            return self._send_json({"ok": False, "forbidden": True,
+                                    "error": "凭据由程序内置并由管理员管理 — 成员无需也不能修改"}, 200)
         try:
             if parsed.path == "/api/settings":
                 return self._handle_settings(payload)
@@ -635,6 +716,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_access_issue(payload)
             if parsed.path == "/api/access/set_status":
                 return self._handle_access_set_status(payload)
+            if parsed.path == "/api/access/set_role":
+                return self._handle_access_set_role(payload)
+            if parsed.path == "/api/access/upgrade":
+                return self._handle_access_upgrade(payload)
         except lark.LarkError as e:
             return self._send_json({"ok": False, "error": str(e)}, 200)
         except Exception as e:  # noqa

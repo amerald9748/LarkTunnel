@@ -16,7 +16,11 @@ a = Analysis(
     datas=[
         (os.path.join(here, "static"), "static"),
         (os.path.join(root, "config", "config.js"), "config"),
-    ],
+    ] + ([(os.path.join(root, ".tmp", "bundled.bin"), "config")]
+         if os.path.isfile(os.path.join(root, ".tmp", "bundled.bin")) else [])
+      + [(os.path.join(here, "dist-extras", "使用说明.txt"), ".")],   # member quick guide beside the exe
+    # ^ bundled.bin = obfuscated App ID/Secret written by bundle_secrets.py
+    #   right before the build (never committed; .tmp/ is git-ignored)
     hiddenimports=[
         "webview.platforms.edgechromium", "webview.platforms.winforms",
         "clr_loader", "clr_loader.netfx", "pythonnet",

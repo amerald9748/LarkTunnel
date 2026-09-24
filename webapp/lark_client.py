@@ -118,8 +118,10 @@ def config_values():
     if tb:
         for label, tid in re.findall(r"'([^']+)'\s*:\s*'(tbl[^']+)'", tb.group(1)):
             tables[label] = tid
+    at = re.search(r"authTable:\s*'([^']*)'", cfg)
     _cfg_cache.update({
         "base_token": m.group(1),
+        "auth_table": (at.group(1).strip() if at else ""),   # team 授权表 (baked in)
         "tables": tables,
         "dev_tables": _flat_block(cfg, "devTables"),
         "prod_trip_link_fields": _flat_block(cfg, "prodTripLinkFields"),

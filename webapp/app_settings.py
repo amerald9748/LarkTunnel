@@ -16,10 +16,19 @@ FILES (all under apppaths.data_dir(), i.e. %APPDATA%\LarkTunnel)
                     teammate's laptop image does not leak the App Secret.
 
 CREDENTIAL RESOLUTION ORDER (resolve_credentials)
-    1. secrets.bin (settings page)          → source "dpapi"
+    1. secrets.bin (settings page, admin)   → source "dpapi"
     2. env LARK_APP_ID / LARK_APP_SECRET    → source "env"
-    3. legacy config/secrets.txt (repo)     → source "legacy"
+    3. config/bundled.bin (baked into the distributed exe by build.bat via
+       bundle_secrets.py; members never type credentials — they only enter
+       their 授权码)                         → source "bundled"
+    4. legacy config/secrets.txt (repo)     → source "legacy"
     none → NoCredentials — the UI then opens ⚙ 设置 automatically.
+
+    bundled.bin is OBFUSCATED (SHA-256 keystream XOR keyed on the Base token),
+    not truly secret: anyone who can read the exe folder can recover it with
+    effort. It keeps the secret out of casual view and out of teammates'
+    hands as a typed value; the real kill switch remains rotating the App
+    Secret in the Feishu console and shipping a new build.
 
 REVOCATION MODEL (documented in the settings page too)
     Access for teammates is controlled two ways, both owner-driven:
@@ -53,6 +62,10 @@ def SECRETS_PATH():
 
 def LEGACY_SECRETS():
     return os.path.join(apppaths.repo_root(), "config", "secrets.txt")
+
+
+def BUNDLED_SECRETS():
+    return os.path.join(apppaths.bundle_root(), "config", "bundled.bin")
 
 
 DEFAULTS = {
@@ -142,6 +155,58 @@ def update_settings(patch: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# bundled credentials (build-time blob) — obfuscation, see module docstring
+# ---------------------------------------------------------------------------
+_BUNDLE_MAGIC = b"LTB1"
+
+
+def _keystream(n, salt: bytes):
+    import hashlib
+    out, counter, seed = b"", 0, b"LarkTunnel|bundle|" + salt
+    while len(out) < n:
+        out += hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
+        counter += 1
+    return out[:n]
+
+
+def _bundle_salt():
+    try:
+        import lark_client
+        return lark_client.config_values()["base_token"].encode("utf-8")
+    except Exception:
+        return b""
+
+
+def write_bundle(path, app_id, app_secret):
+    data = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
+    ks = _keystream(len(data), _bundle_salt())
+    blob = _BUNDLE_MAGIC + bytes(a ^ b for a, b in zip(data, ks))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(blob)
+
+
+def read_bundle(path=None):
+    path = path or BUNDLED_SECRETS()
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError:
+        return None
+    if not blob.startswith(_BUNDLE_MAGIC):
+        return None
+    body = blob[len(_BUNDLE_MAGIC):]
+    try:
+        data = bytes(a ^ b for a, b in zip(body, _keystream(len(body), _bundle_salt())))
+        d = json.loads(data.decode("utf-8"))
+        if d.get("app_id") and d.get("app_secret"):
+            return d["app_id"], d["app_secret"]
+    except Exception:
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # credentials
 # ---------------------------------------------------------------------------
 class NoCredentials(Exception):
@@ -202,6 +267,9 @@ def resolve_credentials():
         a, s = os.environ.get("LARK_APP_ID"), os.environ.get("LARK_APP_SECRET")
         if a and s:
             return a, s, "env"
+        got = read_bundle()
+        if got:
+            return got[0], got[1], "bundled"
         try:
             with io.open(LEGACY_SECRETS(), encoding="utf-8-sig") as f:
                 a, s = _parse_legacy(f.read())
@@ -256,11 +324,12 @@ def credential_status():
     a, s, src = resolve_credentials()
     return {
         "configured": bool(a),
-        "source": src,                        # dpapi | env | legacy | None
+        "source": src,                        # dpapi | env | bundled | legacy | None
         "app_id": a,
         "secret_hint": (s[:3] + "…" + s[-2:]) if s else None,
         "store_path": SECRETS_PATH(),
         "data_dir": apppaths.data_dir(),
+        "bundled": read_bundle() is not None,  # program carries credentials
     }
 
 
