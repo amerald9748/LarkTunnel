@@ -14,7 +14,6 @@ field names, and thresholds. Nothing else is hardcoded.
 | Section | Purpose |
 |---|---|
 | `baseToken` | The Bitable app token containing all workflow tables. |
-| `wikiToken` | Optional — resolve the base token from a Wiki node instead. |
 | `tables` | Friendly **label → table id** registry. Call `base.tableByLabel('3.1')`. |
 | `fields` | Exact column names (字段名) grouped by table. |
 | `warehouses` | Per-warehouse account, plan table, and link fields. |

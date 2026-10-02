@@ -17,6 +17,9 @@ up ISA appointments ↔ delivery trips ↔ inventory rows.
 
 ## Start here
 
+- [[Start Here]] — **read this first**: what the tool is for, who uses which
+  entry point, the daily workflow, the rules, and how to run/release.
+- [[Project History]] — why things are the way they are (decision log).
 - [[Authentication]] — get `lark-cli` logged in.
 - [[Configuration]] — the one file you edit: `config/config.js`.
 - [[Project Structure]] — where everything lives.
@@ -46,12 +49,10 @@ up ISA appointments ↔ delivery trips ↔ inventory rows.
 
 ---
 
-## Status / open questions
+## Status (LTS — 2026-10-02)
 
-> [!warning] Needs confirmation before first live run
-> - Field names marked **VERIFY** in `config/config.js` (especially on tables
->   **5.6** and the **5.x** delivery-plan tables) are best-guesses from the spec.
->   Confirm them read-only with `npm run verify:config`.
-> - Warehouses **`TOR-1140`** and **`卡尔加里（CAL-5505）`** have **no appointment
->   account or delivery-plan table** in the spec. The workflow refuses to guess
->   for them — see [[Warehouse & Account Map]].
+> [!success] Stable. All table ids and 3.1 field names verified live; every
+> warehouse mapped (CAL-5505 → BESTAR; TOR-1140 = pallets-only by design).
+> Two Task-Scheduler services run on the owner machine (webapp :8787 +
+> deletion watcher). Members use the distributed `LarkTunnel.exe`.
+> Decision log: [[Project History]] · Onboarding: [[Start Here]].

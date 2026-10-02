@@ -379,7 +379,7 @@ function renderDetails(out, details) {
 // NOTE: the 5.6 upload/dry-run/commit code that used to live here was removed
 // 2026-08-04. It was a THIRD writer of 5.6 + 出库计划, overlapping ①新建预约
 // and ②计划同步. 文件解析 now only parses and hands rows to those tabs.
-// (Server side: upload_56.py and /api/upload · /api/dryrun_56 · /api/commit_56
+// (Server side: upload_56.py [removed 2026-10-02] and /api/upload · /api/dryrun_56 · /api/commit_56
 //  were retired at the same time.)
 
 function nullSpan() { return el("span", { class: "nullcell" }, "Null"); }

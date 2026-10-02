@@ -13,7 +13,8 @@ Design notes
   and used to mint a tenant_access_token. The secret and the token are never
   returned to callers / the browser.
 * READ ONLY. There are no write methods here on purpose. Writer modules
-  (upload_56.py / appointment_sync.py) call `_api` directly and MUST hold
+  (appointment_sync / appointment_create / inventory_import / access_control)
+  call `_api` directly and MUST hold
   WRITE_LOCK (defined below) so all webapp writes are serialized process-wide.
 
 Environments (LARK_ENV)
@@ -34,6 +35,16 @@ Base on both `/records/search` and `/records`). So we:
   1. search the whole table for the container / ISA (a handful of rows), then
   2. evaluate the view's own filter conditions against those rows locally.
 Conditions we cannot interpret are reported back, never silently ignored.
+
+PROTECTED INVARIANTS (LTS 2026-10-02 — keep these when refactoring)
+-------------------------------------------------------------------
+* No write helpers live here. Every writer holds WRITE_LOCK and sends a
+  client_token (UUID v4, never reused) so Feishu dedupes retries.
+* table_id(label) is the ONLY way code maps a label to a table — it is
+  what makes LARK_ENV=dev safe (dev never touches shared prod 5.x tables).
+* _http wraps raw socket TimeoutError/OSError: unwrapped, a stalled
+  response froze request threads (the 2026-07-31 "button hangs" bug).
+* Credentials never leave the server process (no token/secret in JSON).
 """
 
 import os
@@ -66,8 +77,8 @@ DATE_TYPES = {5, 1001, 1002}  # datetime, created-time, modified-time
 # Which copies of 3.1 / 5.6 this process talks to. "prod" unless LARK_ENV=dev.
 ENV = "dev" if os.environ.get("LARK_ENV", "").strip().lower() == "dev" else "prod"
 
-# Process-wide write serialization. All webapp writers (upload_56,
-# appointment_sync) do check-then-write against /records/search, so two
+# Process-wide write serialization. All webapp writers (appointment_sync,
+# appointment_create, inventory_import) do check-then-write against /records/search, so two
 # concurrent commits could both pass the existence check and double-create.
 # ONE shared lock keeps every write path serialized.
 WRITE_LOCK = threading.Lock()

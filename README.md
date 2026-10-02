@@ -1,71 +1,56 @@
-# 🚇 LarkTunnel
+# 🚇 LarkTunnel · 到仓核对台
 
-Batch-command tooling for a **production Lark (Feishu) Base**. Provides a clean
-wrapper library over `lark-cli` and a documented, agent-runnable workflow for the
-**warehouse appointment & delivery-plan sync**.
+**LTS edition — 2026-10-02.** A guarded operations console for the company's
+production Lark (Feishu) Base: inventory import, appointment creation, delivery-plan
+sync, chain verification, and a permanent deletion audit log. Every write is
+plan (read-only) → operator approval → commit → read-back verification.
 
-> ⚠️ **Production.** Writes are **simulated by default** (safe mode). Never run a
-> live write without a human in the loop. See `docs/60 Safety/Production Guardrails.md`.
+> 📖 **New here? Read [`docs/00 Home/Start Here.md`](docs/00%20Home/Start%20Here.md) first** —
+> what it's for, who uses which entry point, the daily workflow, the rules, and how to
+> run/release. Why things are the way they are: [`docs/00 Home/Project History.md`](docs/00%20Home/Project%20History.md).
+
+## Two ways in
+
+| You are… | Use |
+|---|---|
+| A **member** (warehouse / ops colleague) | The `LarkTunnel.exe` folder your admin sent + your `LT-…` 授权码. See `webapp/dist-extras/使用说明.txt`. |
+| The **admin / maintainer** | This repo. `python webapp/server.py` → http://127.0.0.1:8787 (or the registered Task Scheduler services). Test env: `webapp\run-dev.bat` (:8788, dev copy tables). |
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `config/config.js` | **Single source of truth** — tokens, table ids, field names, warehouse map. Edit this. |
-| `config/secrets.txt` | App ID / Secret (gitignored). |
-| `src/lark/` | Wrapper library — `client.js`, `LarkBase.js`, `LarkTable.js`, `index.js`. |
-| `src/workflow/inputs.example.json` | Template for one appointment session. |
-| `scripts/verify-config.js` | **Read-only** check of config against the live Base. |
-| `webapp/` | **到仓核对台** — 预约同步（批量粘贴→预检→勾选执行）+ 柜号/ISA 查询 + 文件上传。Python 零依赖。见 `webapp/README.md`。 |
-| `docs/` | **Obsidian vault** — open this folder in Obsidian. Start at `00 Home/Home.md`. |
-| `archive/lark_core_legacy/` | Previous forecast/sync project, kept for reference. |
+| `webapp/` | **The tool.** Pure-stdlib Python server + vanilla-JS frontend; exe build scripts. Details: `webapp/README.md`. |
+| `config/config.js` | **Single source of truth** — base token, table ids, field names, warehouse map, env maps. |
+| `tools/deletion-watcher/` | Long-connection listener feeding the 🗑️ 删除日志 (only part with a pip dependency: `lark-oapi`). |
+| `docs/` | Obsidian vault (readable as plain Markdown). Start at `00 Home/Start Here.md`. |
+| `src/`, `scripts/` | Node wrapper library + CLI fallback; `npm run verify:config` (read-only schema check). |
+| `logs/` | `audit.db`, `ops.jsonl`, service logs — local, gitignored. |
 
-## Quick start
+## Everyday commands
 
 ```bash
-npm install
-lark-cli auth login              # authenticate (see docs/10 Setup/Authentication.md)
-npm run verify:config            # READ-ONLY: confirm tables + field names resolve
+npm test                      # 200+ offline unit tests (python -m unittest discover webapp/tests)
+npm run verify:config         # READ-ONLY: confirm table ids + field names still match the Base
+python webapp/server.py       # run the admin server (prod tables)
+webapp\run-dev.bat            # run against dev copy tables
+webapp\build.bat              # build the member exe -> webapp/dist/LarkTunnel/
 ```
 
-Then read **`docs/00 Home/Home.md`** and follow
-**`docs/40 Workflows/Appointment Sync Runbook.md`**.
+## Non-negotiables
 
-### 到仓核对 / 预约同步（webapp，不需要 Node / lark-cli）
+1. Writes only through a reviewed plan; never overwrite 实际板数; never auto-create select options.
+2. One writer per table (📦→3.1 create · ①→5.6 create · ②→3.1 update/5.x/linked 5.6). Keep it that way.
+3. Test on dev copies first (`LARK_ENV=dev`); dev never writes the shared prod 5.x tables.
+4. Schema changes → `config.js` + `appointment_sync.F31/F56` + restart. Option-value changes → in Feishu only.
 
-```bash
-python webapp/server.py     # 生产 · http://127.0.0.1:8787
-webapp\run-dev.bat          # 测试环境（dev 副本表）· http://127.0.0.1:8788
-```
+Full list: `docs/60 Safety/Production Guardrails.md`.
 
-粘贴到仓明细（柜号/路线/板数/箱数 + 可选 ISA/时间），逐行预检 3.1/5.6/出库
-计划，人工勾选后一键执行。只读预检、显式提交、写后回读核实。详见
-`webapp/README.md`。
+---
 
-## Using the library
+## Author's notes（作者填写）
 
-```js
-const lark = require('./src/lark');
-const base = lark.base();
-const inv  = base.tableByLabel('3.1');
+> _留给作者：交接要点、正确操作习惯、不要碰的地方、联系人。更多预留位在
+> `docs/00 Home/Start Here.md` 第 8 节与 `Project History.md` 末尾。_
 
-const row = inv.findUnique([
-  [lark.config.fields.inventory.awb, 'is', '093-9992123'],
-  [lark.config.fields.inventory.destination, 'is', 'YYC3'],
-  [lark.config.fields.inventory.warehouse, 'is', 'BESTAR'],
-]);
-
-// writes are simulated unless LARK_SAFE_MODE=false
-inv.updateRecord(row.record_id, { [lark.config.fields.inventory.actualPallets]: 12 });
-```
-
-## Documentation
-
-The `docs/` folder is an **Obsidian vault** (open the folder in Obsidian for
-wikilinks + graph view; the Markdown is readable anywhere). Key notes:
-
-- `40 Workflows/Appointment Sync Runbook.md` — the step-by-step procedure.
-- `40 Workflows/Decision Tree.md` — the branching logic as flowcharts.
-- `30 Reference/` — table registry, field glossary, warehouse map.
-- `50 Prompts/Agent System Prompt.md` — paste-ready framing for an agent.
-- `60 Safety/Production Guardrails.md` — read before any live run.
+-

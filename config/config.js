@@ -5,10 +5,10 @@
  * Everything the wrappers and the workflow runbook use is declared here so an
  * operator (or an agent) never has to hunt for a table id or field name.
  *
- * ⚠️  PRODUCTION BASE. Field names / table ids marked `VERIFY` below are
- *     best-guesses transcribed from the workflow spec and have NOT yet been
- *     confirmed against the live schema. Before any live run, confirm them
- *     read-only:  lark-cli base +field-list --base-token <t> --table-id <t> --as user
+ * ⚠️  PRODUCTION BASE. Table ids and 3.1 field names were confirmed against the
+ *     live schema (2026-07-22 .. 2026-09-03). Anything still marked `VERIFY`
+ *     is a best-guess — confirm read-only before relying on it:
+ *     npm run verify:config   (lark-cli base +field-list under the hood)
  * ============================================================================
  */
 
@@ -20,9 +20,6 @@ module.exports = {
   // Reused from the previous project per user confirmation.
   baseToken: 'C13Zb8l6WassnesyRJhufdvLsFe',
 
-  // Optional: if the base moves, a wiki node token/URL can be resolved instead.
-  // LarkBase.resolveBaseTokenFromWiki(wikiToken)
-  wikiToken: 'FFcNw6f15in36NklOy3laH9jgxb', // VERIFY: from old project, may be unrelated
 
   // lark-cli identity to act as.
   actAs: 'user',
@@ -247,7 +244,7 @@ module.exports = {
     palletDiffWarning: 2, // |provided - estimated| > this => warn (node runbook)
     // Webapp upload guard: |file pallets - 预计板数| > this => BLOCK the row
     // (no 5.6 create / no trip / no 实际板数 write). Mirrored as
-    // PALLET_DIFF_BLOCK in webapp/upload_56.py.
+    // PALLET_DIFF_WARN in webapp/appointment_sync.py.
     palletDiffBlock: 3,
     tripPalletCap: 28, // trip total pallets > this => warn (overflow)
   },

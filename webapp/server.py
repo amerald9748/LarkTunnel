@@ -668,7 +668,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         # NOTE: /api/upload · /api/dryrun_56 · /api/commit_56 were RETIRED
-        # 2026-08-04 — upload_56.py was a third writer of 5.6 + 出库计划,
+        # 2026-08-04 — upload_56.py (module removed 2026-10-02) was a third writer of 5.6 + 出库计划,
         # overlapping ①新建预约 / ②计划同步. 文件解析 is parse-only now.
         if parsed.path not in ("/api/query", "/api/parse",
                                "/api/sync/plan", "/api/sync/commit",

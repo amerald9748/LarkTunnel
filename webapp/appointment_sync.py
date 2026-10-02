@@ -358,7 +358,7 @@ def _batch_get(table_id_, record_ids, field_names=None):
 def _find_31(t31, awb, route, warehouse, plan_link_31=None):
     """3.1 rows for 柜号+路线+仓库. Exact 柜号 first; fall back to a contains
     search tightened to prefix+1char matches (拆柜后缀 …A/…B), same rule as
-    upload_56._find_31. READ."""
+    the retired upload_56 module (removed 2026-10-02). READ."""
     # 目的地路线 is requested even though it is a search CONDITION here: ③核对
     # reads it back off the row to detect a wrong-bay assignment (appointment
     # 目的地 vs the row's 目的地路线). Omitting it made that check silently
@@ -379,7 +379,7 @@ def _find_31(t31, awb, route, warehouse, plan_link_31=None):
     if not hits:
         # 拆柜/截断后缀 = 恰好多 1 个字符（…A/…B 或补回的第 8 位数字）。收紧到
         # 该模式，避免把「MATU…/ZCSU…」这类合并柜号行误当成本柜号的行。
-        # (Same rule as upload_56._find_31.)
+        # (Rule inherited from the retired upload_56 module.)
         pat = re.compile(re.escape(awb) + r"[A-Z0-9]")
         hits = [h for h in go("contains", awb)
                 if pat.fullmatch(lark.flat_text((h.get("fields") or {}).get(F31["awb"])))]

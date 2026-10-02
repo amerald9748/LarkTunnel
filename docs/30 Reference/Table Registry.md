@@ -36,6 +36,15 @@ the PROD-pointing links, so they stay empty in dev — verify the dev link
 columns and the dev 5.6 values instead (trip totals are computed by the tool,
 not read from the rollup).
 
+### Test & control tables (same Base)
+
+| Table | Table id | Purpose |
+|---|---|---|
+| `3.1 测试表` | `tblmAEVldrBdd460` | Scratch copy for write experiments (create→read-back→delete verified 2026-07-24). |
+| `3.1.1 库存总表（技术测试用）` | `tblrvsRkdFyeTMd7` | Early technical sandbox. |
+| `1.1 测试表格` | `tblVCef9hxcG39VF` | Early technical sandbox. |
+| `LT授权表` | `tbltF7JR8xQHSCXc` | Team access control (授权码/姓名/状态/到期/角色/最近使用/设备) — read by `webapp/access_control.py`; baked into `config.js authTable`. |
+
 ## Relationships
 
 ```mermaid
