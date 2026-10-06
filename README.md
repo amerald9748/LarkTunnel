@@ -48,9 +48,19 @@ Full list: `docs/60 Safety/Production Guardrails.md`.
 
 ---
 
-## Author's notes（作者填写）
+## Author's notes
 
-> _留给作者：交接要点、正确操作习惯、不要碰的地方、联系人。更多预留位在
+> _交接要点、正确操作习惯。更多预留位在
 > `docs/00 Home/Start Here.md` 第 8 节与 `Project History.md` 末尾。_
 
--
+- Intended to be used with the below two WxWork forms:
+
+VAST Delivery Plans:
+https://doc.weixin.qq.com/smartsheet/s3_AVUAiQYcAP4SGGSdZ51quT022t2Vo?scode=AMcAvgd2AAw8ty0J8uAVUAiQYcAP4&version=5.0.9.6065&platform=win&tab=q979lj&viewId=vukaF8
+
+BESTAR Delivery Plans:
+https://doc.weixin.qq.com/smartsheet/s3_ARoASgZHADISGwM2X0tDRTzCTlO2i?scode=APMAYAepAFonGMNj22AaIADwY_AL8&journal_source=chat&roomid=Person%3A1688857363746722%3A1688857542906621&open_source=wecomprivate&version=5.0.9.6060&platform=win&tab=q979lj&viewId=vukaF8
+
+The above forms need to follow the shapes in the tunnel input. Rearrange and maintain these forms to ensure all future operations are consistent.
+
+The GFL plan form needs some slight extra work. To-do later.
