@@ -381,6 +381,14 @@ def field_meta(table_id):
         for f in items:
             m = {"field_id": f.get("field_id"), "field_name": f.get("field_name"),
                  "type": f.get("type"), "options": _extract_options(f)}
+            if f.get("type") in (18, 21):          # one-way / duplex link
+                prop = f.get("property") or {}
+                # NOTE: back_field_name is the partner's name AT CREATION —
+                # Lark does not refresh it on renames — so callers pair link
+                # columns by table_id, never by that name.
+                m["link"] = {"table_id": prop.get("table_id"),
+                             "back_field_name": prop.get("back_field_name"),
+                             "multiple": prop.get("multiple")}
             by_id[m["field_id"]] = m
             by_name[m["field_name"]] = m
         return {"by_id": by_id, "by_name": by_name}
@@ -388,7 +396,7 @@ def field_meta(table_id):
 
 
 def field_types(table_id):
-    return {n: m["type"] for n, m in field_meta(table_id)["by_name"].items()}
+    return {n: m.get("type") for n, m in field_meta(table_id)["by_name"].items()}
 
 
 # ---------------------------------------------------------------------------

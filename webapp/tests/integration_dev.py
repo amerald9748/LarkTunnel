@@ -326,7 +326,7 @@ def phase_group_create():
 
     joined = " | ".join(stages)
     check("commit streamed stage progress",
-          "复检" in joined and "写入 1/4" in joined and "核实" in joined
+          "复检" in joined and "写入 1/5" in joined and "核实" in joined
           and stages[-1] == "完成", joined[:200])
 
     trip_id, isa_rec = trip_ids.pop(), isa_recs.pop()

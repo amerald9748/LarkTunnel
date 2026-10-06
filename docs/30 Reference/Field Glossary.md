@@ -46,7 +46,7 @@ All names below confirmed against the live schema 2026-07-29.
 | `复制时间列` | `timestamp` | text `YYYY/MM/DD HH:MM` | The copy-time value tied to this ISA. |
 | `目的地` | `destination` | select | Destination for the appointment. |
 | `预约账号` | `account` | select | Appointment account (derived from warehouse). |
-| `5.2 出库计划 卡尔加里` etc. | `planLinks` (map) | two-way link→5.x | ONE back-link field per 5.x plan table (`5.3 出库计划 埃德蒙顿`, `5.4 出库计划 温哥华`, `5.5 出库计划-GFL-预约信息`). There is **no** single `配送计划` field on live 5.6. Empty ⇒ ISA not yet tied to a trip in that table. Auto-fills when the 5.x side (`预约信息`) is written. |
+| `5.2 出库计划 卡尔加里` etc. | `planLinks` (map) | two-way link→5.x | ONE back-link field per 5.x plan table (`5.3 出库计划 埃德蒙顿`, `5.4 出库计划 温哥华`, `5.5 出库计划-GFL-预约信息`). There is **no** single `配送计划` field on live 5.6. Empty ⇒ ISA not yet tied to a trip in that table. Auto-fills when the 5.x side (`预约信息`) is written. **A table can carry more than one such column**: re-creating the `预约信息` duplex in Lark adds a new back-link column and freezes the old one (live 5.2 since 2026-10: `5.2 出库计划 卡尔加里 2` is the live column, `5.2 出库计划 卡尔加里` only holds historical links). The webapp reads every duplex column targeting the plan table and confirms each candidate trip through its own `预约信息` (`appointment_sync._link_cols_on_56` / `_appt_trips_info`). |
 
 ## Tables 5.x — Delivery plans / trips (`config.fields.deliveryPlan`)
 

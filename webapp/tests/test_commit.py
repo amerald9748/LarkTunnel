@@ -61,6 +61,15 @@ class WritingFixture(Fixture):
                         row["fields"][k] = ([{"text": v}] if k == "实际板数"
                                             else {"link_record_ids": v}
                                             if isinstance(v, list) else v)
+                        if k == "5.4 VAST-VAN-01":
+                            # duplex: the trips' 库存信息 follows the 3.1 link
+                            for tid, tf in self.trips.items():
+                                inv = tf.setdefault("库存信息-元浩", {}
+                                                    ).setdefault("link_record_ids", [])
+                                if tid in v and rid not in inv:
+                                    inv.append(rid)
+                                if tid not in v and rid in inv:
+                                    inv.remove(rid)
                 elif table == T56:
                     row = next(x for x in self.rows56 if x["record_id"] == rid)
                     for k, v in fields.items():
@@ -68,6 +77,17 @@ class WritingFixture(Fixture):
                 elif table == T54:
                     self.trips[rid].update(
                         {k: {"link_record_ids": v} for k, v in fields.items()})
+            return {"records": payload["records"]}
+        if path.endswith("/records/batch_delete"):
+            self.calls.append(("delete", table, payload, token))
+            if table == T54:
+                for rid in payload["records"]:
+                    self.trips.pop(rid, None)
+                    # duplex links vanish with the record, as in a real Base
+                    for row in self.rows31 + self.rows56:
+                        for v in row["fields"].values():
+                            if isinstance(v, dict) and rid in (v.get("link_record_ids") or []):
+                                v["link_record_ids"].remove(rid)
             return {"records": payload["records"]}
         raise AssertionError(f"unexpected write path {path}")
 
@@ -278,6 +298,104 @@ class TestCommitPhases(CommitCase):
         u = _uuid.UUID(t1)
         self.assertEqual(u.version, 4)
         self.assertEqual(u.variant, _uuid.RFC_4122)
+
+
+class TestMergeDuplicatePlans(CommitCase):
+    """One appointment, several 出库计划 (operator request 2026-10-05): the
+    shipments consolidate onto the dominant plan, empty duplicates are
+    deleted, duplicates carrying operator content are only detached."""
+
+    def _dupes(self):
+        # appt owns tBig (3 shipments) and tSmall (2 shipments); the pasted
+        # row r31a is a NEW shipment for the same appointment
+        self.fx.rows31 = [make_31()] + [
+            make_31(f"b{i}", awb=f"B{i}", actual="2", plan_links=["tBig"]) for i in range(3)
+        ] + [make_31(f"s{i}", awb=f"S{i}", actual="2", plan_links=["tSmall"]) for i in range(2)]
+        self.fx.rows56 = [make_56("appt", isa=9903350996, trip_links=["tSmall", "tBig"])]
+        self.fx.trips["tBig"] = make_trip(inv_ids=["b0", "b1", "b2"], isa_ids=["appt"])
+        self.fx.trips["tSmall"] = make_trip(inv_ids=["s0", "s1"], isa_ids=["appt"])
+
+    def test_merge_moves_all_shipments_and_deletes_empty_duplicate(self):
+        self._dupes()
+        planned = sync.plan("VAST", LINE_A)
+        row = planned["rows"][0]
+        merge = next(a for a in row["actions"] if a["type"] == "merge_trips")
+        self.assertEqual(merge["keep"], "tBig")
+        self.assertEqual(merge["move_rows"], ["s0", "s1"])
+        self.assertEqual(merge["delete"], ["tSmall"])
+        self.assertEqual(merge["detach"], [])
+        self.assertNotIn("create_trip", [a["type"] for a in row["actions"]])
+        res = sync.commit("VAST", LINE_A, self.approve_all(planned), "prod")
+
+        kinds = [(k, t) for k, t, _, _ in self.fx.calls]
+        self.assertEqual(kinds, [("update", T31),          # move s0/s1 -> tBig
+                                 ("delete", T54),          # tSmall gone
+                                 ("update", T31)])         # the pasted row joins
+        self.assertNotIn("tSmall", self.fx.trips)
+        links = {r["record_id"]: r["fields"]["5.4 VAST-VAN-01"]["link_record_ids"]
+                 for r in self.fx.rows31}
+        self.assertEqual(links, {"r31a": ["tBig"], "b0": ["tBig"], "b1": ["tBig"],
+                                 "b2": ["tBig"], "s0": ["tBig"], "s1": ["tBig"]})
+        out = next(r for r in res["rows"] if r.get("approved"))
+        self.assertEqual(out["commit"]["merged"], "tBig")
+        self.assertTrue(out["commit"]["verified"], out["commit"]["checks"])
+        self.assertTrue(any(ck["what"] == "合并出库计划" and ck["ok"]
+                            for ck in out["commit"]["checks"]))
+
+    def test_duplicate_with_operator_content_is_detached_not_deleted(self):
+        self._dupes()
+        self.fx.trips["tSmall"]["出库备注"] = [{"text": "司机已约"}]   # a human touched it
+        planned = sync.plan("VAST", LINE_A)
+        merge = next(a for a in planned["rows"][0]["actions"] if a["type"] == "merge_trips")
+        self.assertEqual(merge["detach"], ["tSmall"])
+        self.assertEqual(merge["delete"], [])
+        sync.commit("VAST", LINE_A, self.approve_all(planned), "prod")
+        kinds = [(k, t) for k, t, _, _ in self.fx.calls]
+        self.assertNotIn(("delete", T54), kinds)
+        self.assertIn("tSmall", self.fx.trips)                       # kept
+        self.assertEqual(self.fx.trips["tSmall"]["预约信息"]["link_record_ids"], [])
+        self.assertEqual(self.fx.trips["tSmall"]["出库备注"], [{"text": "司机已约"}])
+        self.assertTrue(any("请人工检查" in w for w in planned["rows"][0]["warnings"]))
+
+    def test_group_rows_share_one_merge(self):
+        # two pasted lines of the SAME ISA both see the duplicates -> the
+        # merge is written once, not per row
+        self._dupes()
+        self.fx.rows31.append(make_31("r31b", awb="TCNU4251020B", dest="YVR2"))
+        text = LINE_A + "\n" + LINE_B
+        planned = sync.plan("VAST", text)
+        self.assertEqual(sum(1 for r in planned["rows"]
+                             for a in r["actions"] if a["type"] == "merge_trips"), 2)
+        sync.commit("VAST", text, self.approve_all(planned), "prod")
+        kinds = [(k, t) for k, t, _, _ in self.fx.calls]
+        self.assertEqual(kinds.count(("delete", T54)), 1)
+        self.assertEqual(kinds.count(("update", T31)), 2)      # merge move + batch rows
+
+    def test_replan_after_merge_is_clean(self):
+        self._dupes()
+        planned = sync.plan("VAST", LINE_A)
+        sync.commit("VAST", LINE_A, self.approve_all(planned), "prod")
+        row = sync.plan("VAST", LINE_A)["rows"][0]
+        self.assertEqual(row["plan"]["status"], "has_plan_match")
+        self.assertEqual(row["actions"], [])
+
+    def test_row_already_on_duplicate_moves_with_the_merge(self):
+        # 4A: the pasted row sits on the SMALLER duplicate; same ISA+time
+        # pasted -> merge onto tBig and the row follows (no create, no rewrite)
+        self._dupes()
+        self.fx.rows31[0] = make_31(actual="4", plan_links=["tSmall"])
+        self.fx.trips["tSmall"]["库存信息-元浩"]["link_record_ids"].append("r31a")
+        planned = sync.plan("VAST", LINE_A)
+        row = planned["rows"][0]
+        self.assertEqual(row["plan"]["status"], "has_plan_match")
+        types = [a["type"] for a in row["actions"]]
+        self.assertIn("merge_trips", types)
+        link = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual((link["trip_id"], link.get("replace")), ("tBig", True))
+        sync.commit("VAST", LINE_A, self.approve_all(planned), "prod")
+        self.assertNotIn("tSmall", self.fx.trips)
+        self.assertEqual(self.fx.rows31[0]["fields"]["5.4 VAST-VAN-01"]["link_record_ids"],
+                         ["tBig"])
 
 
 if __name__ == "__main__":

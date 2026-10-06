@@ -419,10 +419,11 @@ class TestStep4BNoPlan(PlannerCase):
         self.assertEqual(move["trip_id"], "@group")
         self.assertTrue(move.get("replace"))
 
-    def test_legacy_multi_plan_joins_dominant_trip(self):
-        """Legacy duplicates are NOT repaired (operator decision 2026-08-14),
-        but new shipments must consolidate onto the trip carrying the most
-        shipments — never onto an empty duplicate — so the tangle can't grow."""
+    def test_multi_plan_merges_onto_dominant_trip(self):
+        """Duplicate 出库计划 of one appointment are MERGED (operator request
+        2026-10-05, superseding the 2026-08-14 leave-alone rule): the new
+        shipment joins the trip carrying the most shipments, the duplicate's
+        shipments move there too, and an empty duplicate is deleted."""
         self.fx.rows31 = [make_31()]
         self.fx.rows56 = [make_56("appt", isa=7403350996,
                                   trip_links=["tEmpty", "tBusy"])]
@@ -433,8 +434,44 @@ class TestStep4BNoPlan(PlannerCase):
         link = next(a for a in row["actions"] if a["type"] == "link_trip")
         self.assertEqual(link["trip_id"], "tBusy")       # dominant, not first
         self.assertNotIn("create_trip", self.action_types(row))
-        self.assertTrue(any("历史遗留" in w for w in row["warnings"]),
-                        str(row["warnings"]))
+        merge = next(a for a in row["actions"] if a["type"] == "merge_trips")
+        self.assertEqual((merge["keep"], merge["drop"], merge["delete"]),
+                         ("tBusy", ["tEmpty"], ["tEmpty"]))
+        self.assertTrue(any("合并" in w for w in row["warnings"]), str(row["warnings"]))
+
+    def test_trip_found_through_any_back_link_column(self):
+        """The 5.6 back-link column can be re-created in Lark (live 5.2 case
+        2026-10-05: new trips link via `… 2`, the configured column stays
+        empty). Every duplex column targeting the plan table is read."""
+        meta = {"by_name": {
+            **fake_field_meta(None)["by_name"],
+            "5.4 出库计划 温哥华": {"type": 21, "link": {"table_id": T54}},
+            "5.4 出库计划 温哥华 2": {"type": 21, "link": {"table_id": T54}},
+            "5.2 出库计划 卡尔加里": {"type": 21, "link": {"table_id": "t52"}},
+        }}
+        with mock.patch.object(lark, "field_meta", lambda _t: meta):
+            w = sync._env_wiring("5.4 VAST-VAN-01")
+            self.assertEqual(w["link_on_56_cols"],
+                             ["5.4 出库计划 温哥华", "5.4 出库计划 温哥华 2"])
+            self.fx.rows31 = [make_31()]
+            appt = make_56("appt", isa=7403350996)          # configured column EMPTY
+            appt["fields"]["5.4 出库计划 温哥华 2"] = {"link_record_ids": ["tripNew"]}
+            self.fx.rows56 = [appt]
+            self.fx.trips["tripNew"] = make_trip(inv_ids=[], isa_ids=["appt"])
+            row = self.plan1(LINE_FULL)
+        self.assertNotIn("create_trip", self.action_types(row))   # no duplicate
+        link = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(link["trip_id"], "tripNew")
+
+    def test_stale_back_link_to_relinked_trip_is_ignored(self):
+        """A 5.6 column may still list a trip whose 预约信息 now points
+        elsewhere (or that was deleted) — the trip itself is authoritative."""
+        self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56("appt", isa=7403350996, trip_links=["tOld", "tGone"])]
+        self.fx.trips["tOld"] = make_trip(inv_ids=["x1"], isa_ids=["someoneElse"])
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["plan"]["status"], "create_trip")
+        self.assertNotIn("merge_trips", self.action_types(row))
 
     def test_recent_trip_registry_defeats_search_lag(self):
         """A plan created moments ago (previous batch) must be found even

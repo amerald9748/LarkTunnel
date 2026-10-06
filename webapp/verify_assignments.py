@@ -38,7 +38,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import lark_client as lark
-from appointment_sync import (F31, F56, WAREHOUSES, DEST_RE, ISA_RE,
+from appointment_sync import (F31, F56, WAREHOUSES, DEST_RE, ISA_RE, _cols56,
                               norm_time, _search, _batch_get, _env_wiring,
                               _find_31, _disambiguate_31, _base)
 
@@ -217,12 +217,12 @@ def _verify_awb(p, warehouse, wh, wiring, t31, t56, t5x, isa_usage, usage_lock):
             out.append(row)
             continue
         rec56 = isa_ids[0]
-        link56 = wiring.get("link_on_56")
+        cols56 = _cols56(wiring)      # every 5.6 back-link column (union)
         a = _batch_get(t56, [rec56], [F56["isa"], F56["time"], F56["dest"],
-                                      F56["account"], link56]).get(rec56, {})
+                                      F56["account"], *cols56]).get(rec56, {})
         # 1-to-1 invariant audit: an appointment must have exactly ONE
         # 出库计划 in this plan table
-        if len(lark.link_ids(a.get(link56))) > 1:
+        if len({t for c in cols56 for t in lark.link_ids(a.get(c))}) > 1:
             row["flags"].append("multi_plan")
         isa_num = lark.num_of(a.get(F56["isa"]))
         appt = {"record_id": rec56,

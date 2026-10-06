@@ -910,6 +910,10 @@ const ACTION_LABEL = {
   // attach = the 出库计划 had no appointment; relink = newest-wins repoint
   // onto an EXISTING 5.6 record carrying the pasted ISA
   set_trip_isa: (a) => a.mode === "relink" ? "改挂到已有预约" : "出库计划补挂预约",
+  // one appointment had several 出库计划 -> fold onto the kept one
+  merge_trips: (a) => `合并重复出库计划 → 保留 ${a.keep}（移入 ${a.move_rows.length} 件`
+    + (a.delete.length ? `，删除空计划 ${a.delete.length}` : "")
+    + (a.detach.length ? `，解除关联 ${a.detach.length}` : "") + "）",
 };
 const PLAN_LABEL = {
   has_plan_match: ["ok", "✓ 计划一致"],
@@ -1061,7 +1065,7 @@ function execSync() {
   }
   const NAMES = { fill_pallets: "填 3.1 实际板数", update_isa_time: "更新已关联预约ISA/时间",
     link_trip: "挂到出库计划", create_trip: "新建出库计划(5.x)",
-    set_trip_isa: "出库计划挂/改挂预约" };
+    set_trip_isa: "出库计划挂/改挂预约", merge_trips: "合并重复出库计划" };
   const lines = Object.entries(counts).map(([k, v]) => `  · ${NAMES[k] || k} × ${v}`);
   const envLabel = sync.plan.env === "dev" ? "DEV 测试环境（dev 副本表）" : "‼ PROD 生产环境";
   if (!confirm(`确认执行以下写入？\n\n环境：${envLabel}\n仓库：${sync.plan.warehouse}` +

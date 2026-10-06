@@ -135,6 +135,42 @@ LINK_ON_56 = {
     "5.5 GFL-VAN-02": "5.5 出库计划-GFL-预约信息",
 }
 
+
+def _link_cols_on_56(plan_table, fallback):
+    """EVERY duplex-link column on the env's 5.6 that targets `plan_table`,
+    discovered from live field metadata (5-min cached), configured name
+    first. Live finding 2026-10-05: the 5.2 `预约信息` duplex had been
+    re-created in Lark, so new trips back-link through a NEW 5.6 column
+    (`5.2 出库计划 卡尔加里 2`) while the configured column kept its old
+    links and never gained new ones. Reading only the configured column
+    answered "no plan yet" for every recent appointment and ② created
+    duplicate 出库计划. The union of all columns targeting the table is
+    immune to re-creations/renames. The configured name is the fallback
+    when metadata is unavailable (or carries no link detail, as in the
+    offline test fixtures)."""
+    try:
+        t56, t5x = lark.table_id("5.6"), lark.table_id(plan_table)
+        meta = lark.field_meta(t56)["by_name"]
+    except lark.LarkError:
+        meta = {}
+    found = sorted(name for name, m in meta.items()
+                   if m.get("type") == 21
+                   and (m.get("link") or {}).get("table_id") == t5x)
+    if not found:
+        return [fallback] if fallback else []
+    if fallback in found:
+        found.remove(fallback)
+        found.insert(0, fallback)
+    return found
+
+
+def _cols56(wiring):
+    """The 5.6 back-link columns to read for this plan table (see above)."""
+    cols = wiring.get("link_on_56_cols")
+    if cols:
+        return list(cols)
+    return [wiring["link_on_56"]] if wiring.get("link_on_56") else []
+
 # Thresholds (mirror config.js `thresholds`).
 PALLET_DIFF_WARN = 2   # |提供板数 - 预计板数| > 2  => W1/W2 warning
 TRIP_PALLET_CAP = 28   # trip total pallets > 28    => W3 warning
@@ -432,7 +468,8 @@ def _env_wiring(plan_table):
                         tables with a dev copy (config.js devTables) qualify;
                         dev mode NEVER writes into the shared prod 5.x tables.
         plan_link_31  — field ON 3.1 linking to the trip table
-        link_on_56    — field ON 5.6 linking to the trip table
+        link_on_56    — field ON 5.6 linking to the trip table (configured)
+        link_on_56_cols — ALL such fields (discovered; see _link_cols_on_56)
         isa_field     — field ON the trip table linking to 5.6
         inv_field     — field ON the trip table linking to 3.1
     """
@@ -442,14 +479,16 @@ def _env_wiring(plan_table):
     if lark.env() == "dev":
         if plan_table not in cfg["dev_tables"]:
             return {"enabled": False}     # no dev copy -> trips OFF in dev
+        cols = _link_cols_on_56(plan_table, cfg["dev_link_on_56"][plan_table])
         return {"enabled": True,
                 "plan_link_31": cfg["dev_plan_link_fields_31"][plan_table],
-                "link_on_56": cfg["dev_link_on_56"][plan_table],
+                "link_on_56": cols[0], "link_on_56_cols": cols,
                 "isa_field": cfg["dev_trip_isa_fields"][plan_table],
                 "inv_field": cfg["dev_trip_link_fields"][plan_table]}
+    cols = _link_cols_on_56(plan_table, LINK_ON_56[plan_table])
     return {"enabled": True,
             "plan_link_31": plan_table,   # prod column is named like the label
-            "link_on_56": LINK_ON_56[plan_table],
+            "link_on_56": cols[0], "link_on_56_cols": cols,
             "isa_field": "预约信息",
             "inv_field": cfg["prod_trip_link_fields"][plan_table]}
 
@@ -517,7 +556,8 @@ def _obs56(f, link56=None):
     o = {"isa": int(isa) if isa is not None else None,
          "time": norm_time(lark.flat_text(f.get(F56["time"])))}
     if link56:
-        o["trips"] = sorted(lark.link_ids(f.get(link56)))
+        cols = [link56] if isinstance(link56, str) else list(link56)
+        o["trips"] = sorted({t for c in cols for t in lark.link_ids(f.get(c))})
     return o
 
 
@@ -544,16 +584,15 @@ def _recheck(rows, t31, t56, t5x, wiring):
             need.setdefault(kind, set()).update(recs)
     plan_link = wiring.get("plan_link_31")
     isa_field, inv_field = wiring.get("isa_field"), wiring.get("inv_field")
-    link56 = wiring.get("link_on_56")
+    cols56 = _cols56(wiring)
     cur = {"31": _batch_get(t31, need["31"],
                             [F31["awb"], F31["actual"]] + ([plan_link] if plan_link else [])),
            "5x": (_batch_get(t5x, need["5x"], [x for x in (isa_field, inv_field) if x])
                   if t5x and need["5x"] else {}),
-           "56": _batch_get(t56, need["56"],
-                            [F56["isa"], F56["time"]] + ([link56] if link56 else []))}
+           "56": _batch_get(t56, need["56"], [F56["isa"], F56["time"]] + cols56)}
     fresh = {"31": lambda f: _obs31(f, plan_link),
              "5x": lambda f: _obs5x(f, isa_field, inv_field),
-             "56": lambda f: _obs56(f, link56)}
+             "56": lambda f: _obs56(f, cols56)}
     changed = {}
     for r in rows:
         for kind, recs in (r.get("observed") or {}).items():
@@ -715,19 +754,18 @@ def _resolve_isa(ctx, isa):
     with ctx["isa_lock"]:
         if isa in ctx["isa_cache"]:
             return ctx["isa_cache"][isa]
-        link56 = ctx["wiring"].get("link_on_56")     # env's 5.6-side trip link
-        fields = [F56["isa"], F56["time"], F56["dest"], F56["account"]]
-        if link56:
-            fields.append(link56)
+        cols56 = _cols56(ctx["wiring"])              # env's 5.6-side trip links
+        fields = [F56["isa"], F56["time"], F56["dest"], F56["account"]] + cols56
         hits = _search(ctx["t56"], [
             {"field_name": F56["isa"], "operator": "is", "value": [str(isa)]},
         ], fields)
         res = None
         if hits:
             best = None
-            if link56:
+            if cols56:
                 best = next((h for h in hits
-                             if lark.link_ids((h.get("fields") or {}).get(link56))), None)
+                             if any(lark.link_ids((h.get("fields") or {}).get(c))
+                                    for c in cols56)), None)
             if best is None:
                 best = next((h for h in hits if (h.get("fields") or {})
                              .get(F56["account"]) == ctx["wh"]["account"]), None)
@@ -746,35 +784,119 @@ def _resolve_isa(ctx, isa):
         return res
 
 
-def _appt_trips(ctx, ex):
-    """出库计划 record ids already serving appointment `ex` in this
-    warehouse's plan table — the 1-to-1 lookup. Combines the (fresh) 5.6
-    link field with the in-process recent-trips registry, so a trip created
-    seconds ago in a previous batch is found even inside the search-index
-    lag window.
+def _appt_trips_info(ctx, ex):
+    """[(trip_id, inv_record_ids)] for every 出库计划 in this warehouse's plan
+    table that CURRENTLY claims appointment `ex`, DOMINANT first — the trip
+    carrying the most shipments (ties broken by record id).
 
-    LEGACY DUPLICATES: 360 appointments in prod predate this invariant and
-    hold 2–3 出库计划 (operator decided 2026-08-14 not to repair history).
-    Callers take ids[0], so when several exist we return the DOMINANT one
-    first — the trip carrying the most shipments (ties broken by record id
-    for determinism). New shipments therefore consolidate onto the real plan
-    instead of scattering onto an empty duplicate, so the legacy tangle
-    cannot grow. Costs one extra read, and only for such appointments."""
-    link56 = ctx["wiring"].get("link_on_56")
-    ids = lark.link_ids(ex["fields"].get(link56)) if link56 else []
-    recent = _recent_trip_get(ex["rec_id"], ctx["wh"].get("plan_table"))
+    Candidates come from every 5.6 back-link column targeting the plan table
+    (see _link_cols_on_56) plus the in-process recent-trips registry, so a
+    trip created seconds ago is found even inside the search-index lag
+    window. Each candidate is then CONFIRMED by reading the trip itself
+    (batch_get = record store, authoritative): only trips whose 预约信息
+    actually holds `ex` count, so a stale 5.6 column, a deleted trip or one
+    relinked meanwhile can never steer the 1-to-1 decision.
+
+    Several results = duplicate plans for one appointment: callers fold them
+    into one via _plan_merge (operator request 2026-10-05, superseding the
+    2026-08-14 "leave legacy duplicates alone" rule)."""
+    wiring = ctx["wiring"]
+    plan_table = ctx["wh"].get("plan_table")
+    ids = []
+    for c in _cols56(wiring):
+        for t in lark.link_ids(ex["fields"].get(c)):
+            if t not in ids:
+                ids.append(t)
+    recent = _recent_trip_get(ex["rec_id"], plan_table)
     if recent and recent not in ids:
-        ids = [recent] + ids
-    if len(ids) > 1:
-        plan_table = ctx["wh"].get("plan_table")
-        inv_field = ctx["wiring"].get("inv_field")
-        try:
-            got = _batch_get(lark.table_id(plan_table), ids, [inv_field])
-            ids.sort(key=lambda t: (-len(lark.link_ids((got.get(t) or {})
-                                                      .get(inv_field))), t))
-        except lark.LarkError:
-            ids.sort()          # unreadable -> at least stay deterministic
-    return ids
+        ids.insert(0, recent)
+    if not ids:
+        return []
+    isa_field, inv_field = wiring.get("isa_field"), wiring.get("inv_field")
+    got = _batch_get(lark.table_id(plan_table), ids, [isa_field, inv_field])
+    info = []
+    for t in ids:
+        f = got.get(t)
+        if f is None or ex["rec_id"] not in lark.link_ids(f.get(isa_field)):
+            continue
+        info.append((t, lark.link_ids(f.get(inv_field))))
+    info.sort(key=lambda x: (-len(x[1]), x[0]))
+    return info
+
+
+def _appt_trips(ctx, ex):
+    """出库计划 record ids serving appointment `ex` — see _appt_trips_info."""
+    return [t for t, _ in _appt_trips_info(ctx, ex)]
+
+
+# Field types that are DERIVED (links / formula / lookup / auto / audit
+# columns) — never operator content when judging whether a duplicate trip
+# is empty.
+_DERIVED_TYPES = {18, 19, 20, 21, 1001, 1002, 1003, 1004, 1005}
+# Auto-filled on every trip (预约账号 mirrors the appointment; 分组时间 is the
+# creation-day stamp an automation sets) — present even on a duplicate the
+# tool itself created seconds ago, so neither counts as operator content.
+_TRIP_IGNORE_FIELDS = {"预约账号", "分组时间"}
+
+
+def _trip_has_content(fields, t5x, isa_field, inv_field):
+    """Does a 出库计划 carry anything beyond its two links? Attachments (POD /
+    TDR…), notes, dates, truck/LTL choices mean a human worked on it: such a
+    duplicate is only DETACHED from the appointment on merge, never deleted.
+    Unknown types (offline fixtures) are treated as content — the safe side."""
+    try:
+        types = lark.field_types(t5x)
+    except lark.LarkError:
+        types = {}
+    for k, v in (fields or {}).items():
+        if k in (isa_field, inv_field) or k in _TRIP_IGNORE_FIELDS:
+            continue
+        if types.get(k) in _DERIVED_TYPES:
+            continue
+        if v in (None, "", [], {}, False, 0):
+            continue
+        return True
+    return False
+
+
+def _plan_merge(ctx, row, ex, info, W, exclude_rid=None):
+    """Appointment `ex` has several 出库计划 in this plan table (`info` =
+    _appt_trips_info output, dominant first). Plan ONE merge: every shipment
+    on the duplicates moves onto the dominant plan; duplicates carrying
+    nothing else are deleted, those with operator content are detached from
+    the appointment and left for a human. Returns (kept trip id, moved 3.1
+    record ids) so the caller can count them toward the W3 cap. Rows of one
+    ISA group plan identical merges; commit() dedupes them by kept trip.
+    `exclude_rid` = the current row (it gets its own link_trip action)."""
+    wiring = ctx["wiring"]
+    isa_field, inv_field = wiring.get("isa_field"), wiring.get("inv_field")
+    t5x = lark.table_id(ctx["wh"].get("plan_table"))
+    keep, keep_inv = info[0]
+    drops = info[1:]
+    full = _batch_get(t5x, [t for t, _ in drops])          # ALL fields: content check
+    move, delete, detach = [], [], []
+    for t, inv in drops:
+        for r31 in inv:
+            if r31 != exclude_rid and r31 not in keep_inv and r31 not in move:
+                move.append(r31)
+        if _trip_has_content(full.get(t), t5x, isa_field, inv_field):
+            detach.append(t)
+        else:
+            delete.append(t)
+        _note(row, "5x", t, _obs5x(full.get(t) or {}, isa_field, inv_field))
+    _note(row, "5x", keep, {"inv": sorted(keep_inv)})
+    row["actions"].append({"type": "merge_trips", "isa_record_id": ex["rec_id"],
+                           "keep": keep, "drop": [t for t, _ in drops],
+                           "move_rows": sorted(move), "delete": sorted(delete),
+                           "detach": sorted(detach)})
+    row.setdefault("plan", {})["merge"] = {"keep": keep, "drop": len(drops),
+                                           "move": len(move)}
+    W(f"该预约挂了 {len(info)} 个出库计划（应为 1 对 1）— 将合并到货件最多的"
+      f" {keep}：移入 {len(move)} 个货件"
+      + (f"，删除 {len(delete)} 个空计划" if delete else "")
+      + (f"，{len(detach)} 个含其他信息（POD/备注等）的计划仅解除预约关联，请人工检查"
+         if detach else ""))
+    return keep, move
 
 
 def _plan_row(ctx, p):
@@ -944,18 +1066,22 @@ def _plan_row(ctx, p):
             if p.get("isa") is not None:
                 ex = _resolve_isa(ctx, p["isa"])
                 if ex:
-                    _note(row, "56", ex["rec_id"], _obs56(ex["fields"], wiring.get("link_on_56")))
+                    _note(row, "56", ex["rec_id"], _obs56(ex["fields"], _cols56(wiring)))
                     if ex["multi"]:
                         W(f"5.6 中 ISA {p['isa']} 存在多条，按最匹配的一条处理")
-                    ex_trips = _appt_trips(ctx, ex)
-                    if ex_trips:
+                    ex_info = _appt_trips_info(ctx, ex)
+                    if ex_info:
                         # 1-to-1: the appointment already has its 出库计划 —
                         # move the ROW there instead of attaching a second
-                        # plan to the appointment.
+                        # plan to the appointment (folding duplicates first).
+                        keep = ex_info[0][0]
+                        if len(ex_info) > 1:
+                            keep, _ = _plan_merge(ctx, row, ex, ex_info, W,
+                                                  exclude_rid=rid)
                         row["actions"].append({"type": "link_trip",
                                                "record_id": rid,
                                                "plan_link_field": plan_link_field,
-                                               "trip_id": ex_trips[0],
+                                               "trip_id": keep,
                                                "replace": True})
                         N("该预约已有出库计划 — 本货件移挂过去（原无预约的出库计划保留）")
                     else:
@@ -971,10 +1097,11 @@ def _plan_row(ctx, p):
             return row
 
         isa_rec_id = isa_ids[0]
+        cols56 = _cols56(wiring)
         isa_rec = _batch_get(ctx["t56"], [isa_rec_id],
                              [F56["isa"], F56["time"], F56["dest"], F56["account"]]
-                             ).get(isa_rec_id, {})
-        _note(row, "56", isa_rec_id, _obs56(isa_rec))
+                             + cols56).get(isa_rec_id, {})
+        _note(row, "56", isa_rec_id, _obs56(isa_rec, cols56))
         cur_isa = lark.num_of(isa_rec.get(F56["isa"]))
         cur_time = norm_time(lark.flat_text(isa_rec.get(F56["time"])))
         row["plan"] = {"status": "has_plan", "trip_id": trip_id,
@@ -988,6 +1115,20 @@ def _plan_row(ctx, p):
 
         same_isa = cur_isa is not None and int(cur_isa) == p["isa"]
         same_time = cur_time == p["time"]
+        other = None if same_isa else _resolve_isa(ctx, p["isa"])
+        if other is None or other["rec_id"] == isa_rec_id:
+            # The paste keeps this row on THIS appointment — if the
+            # appointment has gathered duplicate 出库计划, fold them into
+            # one now (the row follows if its own plan is a duplicate).
+            info = _appt_trips_info(ctx, {"rec_id": isa_rec_id, "fields": isa_rec})
+            if len(info) > 1:
+                keep, _ = _plan_merge(ctx, row, {"rec_id": isa_rec_id}, info, W,
+                                      exclude_rid=rid)
+                if keep != trip_id:
+                    row["plan"]["target_trip"] = keep
+                    row["actions"].append({"type": "link_trip", "record_id": rid,
+                                           "plan_link_field": plan_link_field,
+                                           "trip_id": keep, "replace": True})
         if same_isa and same_time:
             row["plan"]["status"] = "has_plan_match"
             N("派送计划的 ISA+时间与提供值一致 — 无需改动")
@@ -1013,9 +1154,8 @@ def _plan_row(ctx, p):
         #       in place with the new ISA + time (a reschedule keeps its row;
         #       the appointment↔plan pairing is untouched).
         row["plan"]["status"] = "has_plan_mismatch"
-        other = None if same_isa else _resolve_isa(ctx, p["isa"])
         if other and other["rec_id"] != isa_rec_id:
-            _note(row, "56", other["rec_id"], _obs56(other["fields"], wiring.get("link_on_56")))
+            _note(row, "56", other["rec_id"], _obs56(other["fields"], _cols56(wiring)))
             if other["multi"]:
                 W(f"5.6 中 ISA {p['isa']} 存在多条，改挂到最匹配的一条")
             other_time = norm_time(lark.flat_text(other["fields"].get(F56["time"])))
@@ -1025,16 +1165,16 @@ def _plan_row(ctx, p):
                                        "isa": p["isa"], "time": p["time"]})
             time_note = (f"，并把其时间 {other_time or '空'} 更新为 {p['time']}"
                          if other_time != p["time"] else "")
-            tgt_trips = _appt_trips(ctx, other)
-            if tgt_trips:
+            tgt_info = _appt_trips_info(ctx, other)
+            if tgt_info:
                 # -- move the ROW onto the target's existing 出库计划 --------
-                tgt = tgt_trips[0]
-                if len(tgt_trips) > 1:
-                    W(f"目标预约挂了 {len(tgt_trips)} 个出库计划（历史遗留，应为 "
-                      f"1 对 1）— 已移挂到货件最多的那个（{tgt}）以便逐步归拢")
+                tgt, moved = tgt_info[0][0], []
+                if len(tgt_info) > 1:
+                    tgt, moved = _plan_merge(ctx, row, other, tgt_info, W,
+                                             exclude_rid=rid)
                 tgt_f = _batch_get(t5x, [tgt], [inv_field]).get(tgt, {})
                 _note(row, "5x", tgt, _obs5x(tgt_f, None, inv_field))
-                tgt_inv = lark.link_ids(tgt_f.get(inv_field))
+                tgt_inv = lark.link_ids(tgt_f.get(inv_field)) + moved
                 grp_sum = (ctx["groups"].get(p["isa"]) or {}).get("pallet_sum",
                                                                   provided)
                 tgt_total = _trip_total_pallets(ctx["t31"], tgt_inv) + grp_sum
@@ -1086,7 +1226,7 @@ def _plan_row(ctx, p):
 
     ex = _resolve_isa(ctx, p["isa"])
     if ex:
-        _note(row, "56", ex["rec_id"], _obs56(ex["fields"], wiring.get("link_on_56")))
+        _note(row, "56", ex["rec_id"], _obs56(ex["fields"], _cols56(wiring)))
         if ex["multi"]:
             W(f"5.6 中 ISA {p['isa']} 存在多条，按最匹配的一条处理")
         acct = ex["fields"].get(F56["account"])
@@ -1095,13 +1235,12 @@ def _plan_row(ctx, p):
         # fresh link + recent-trips registry: a 出库计划 created seconds ago
         # (previous batch) is found even inside the search-index lag window,
         # so we NEVER create a second plan for the same appointment
-        trips56 = _appt_trips(ctx, ex)
-        if trips56:
+        info56 = _appt_trips_info(ctx, ex)
+        if info56:
             # -- 4B(i): ISA already has a trip -> link this shipment into it
-            trip_id = trips56[0]
-            if len(trips56) > 1:
-                W(f"该预约关联了 {len(trips56)} 个出库计划（历史遗留，应为 1 对 1）"
-                  f"— 已挂到货件最多的那个（{trip_id}）以便逐步归拢")
+            trip_id, moved = info56[0][0], []
+            if len(info56) > 1:
+                trip_id, moved = _plan_merge(ctx, row, ex, info56, W, exclude_rid=rid)
             trip = _batch_get(t5x, [trip_id], [inv_field]).get(trip_id, {})
             _note(row, "5x", trip_id, _obs5x(trip, None, inv_field))
             trip_inv_ids = lark.link_ids(trip.get(inv_field))
@@ -1113,7 +1252,7 @@ def _plan_row(ctx, p):
                 # this same trip in this batch (single-line groups sum to just
                 # this row's pallets).
                 grp_sum = (ctx["groups"].get(p["isa"]) or {}).get("pallet_sum", provided)
-                total = _trip_total_pallets(ctx["t31"], trip_inv_ids) + grp_sum
+                total = _trip_total_pallets(ctx["t31"], trip_inv_ids + moved) + grp_sum
                 row["plan"] = {"status": "link_existing", "trip_id": trip_id,
                                "trip_total": total}
                 row["actions"].append({"type": "link_trip", "record_id": rid,
@@ -1211,13 +1350,17 @@ def commit(warehouse, text, approvals, client_env, progress=None, cached_plan=No
       2. batch_update 5.x      — set_trip_isa rows: attach a 预约 to a bare
                                  出库计划, or RELINK it to an existing 5.6
                                  record (newest-wins ISA change)
-      3. batch_update 3.1      — per row: 实际板数 fill + plan link, ONE update
+      3. merge duplicates      — merge_trips rows: 3.1 shipments of the
+                                 duplicate 出库计划 move onto the kept one,
+                                 empty duplicates are deleted, ones with
+                                 operator content only lose their 预约信息
+      4. batch_update 3.1      — per row: 实际板数 fill + plan link, ONE update
                                  per record (link写在 3.1 侧 => 5.x 库存信息
                                  back-link fills itself, both environments)
-      4. batch_update 5.6      — 4A mismatch ISA/time edits (deduped by record;
+      5. batch_update 5.6      — 4A mismatch ISA/time edits (deduped by record;
                                  conflicting values refuse BOTH sides).
                                  UPDATES ONLY — this flow never creates 5.6.
-      5. read-back verification — re-read what we wrote and annotate each row
+      6. read-back verification — re-read what we wrote and annotate each row
                                  verified=True/False. Nothing is trusted blind.
     Every phase failure is captured per-row; a failed prerequisite stops the
     dependent actions of that row only (never the whole batch).
@@ -1309,7 +1452,7 @@ def _commit_locked(warehouse, text, approvals, tick, cached_plan=None):
     # UPDATES existing appointments.
 
     # ---- Phase 1: one 出库计划 record per ISA group -----------------------
-    tick(stage="写入 1/4 · 新建出库计划（5.x）", done=0, total=0, current="")
+    tick(stage="写入 1/5 · 新建出库计划（5.x）", done=0, total=0, current="")
     group_trip_rec = {}    # isa -> trip record_id
     trip_jobs = {}         # isa -> (isa_record_id, [rows])
     for r in rows:
@@ -1346,7 +1489,7 @@ def _commit_locked(warehouse, text, approvals, tick, cached_plan=None):
                     r.setdefault("commit", {})["error"] = f"出库计划创建失败：{e}"
 
     # ---- Phase 2: attach an ISA to a pre-existing, appointment-less 出库计划 --
-    tick(stage="写入 2/4 · 出库计划补挂预约")
+    tick(stage="写入 2/5 · 出库计划补挂预约")
     set_jobs = []
     for r in rows:
         if (r.get("commit") or {}).get("error"):
@@ -1375,8 +1518,55 @@ def _commit_locked(warehouse, text, approvals, tick, cached_plan=None):
             for r, _ in set_jobs:
                 r.setdefault("commit", {})["error"] = f"出库计划挂预约失败：{e}"
 
-    # ---- Phase 3: 3.1 updates (实际板数 fill + plan link, merged) ----------
-    tick(stage="写入 3/4 · 更新 3.1（实际板数 + 关联出库计划）")
+    # ---- Phase 3: merge duplicate 出库计划 of one appointment --------------
+    # Order matters: shipments move off the duplicates first, then the
+    # duplicates are detached/deleted — a failure midway leaves a state the
+    # next plan() recognises and finishes (it just plans the merge again).
+    tick(stage="写入 3/5 · 合并重复出库计划")
+    plan_link_field = wiring.get("plan_link_31")
+    merges = {}            # keep -> {"isa_rec", "move", "delete", "detach", "rows"}
+    for r in rows:
+        if (r.get("commit") or {}).get("error"):
+            continue
+        for a in r["actions"]:
+            if a["type"] != "merge_trips":
+                continue
+            m = merges.setdefault(a["keep"], {"isa_rec": a["isa_record_id"],
+                                              "move": set(), "delete": set(),
+                                              "detach": set(), "rows": []})
+            m["move"].update(a["move_rows"])
+            m["delete"].update(a["delete"])
+            m["detach"].update(a["detach"])
+            m["rows"].append(r)
+    for keep, m in sorted(merges.items()):
+        try:
+            if m["move"]:
+                api_write("mv31", f"/open-apis/bitable/v1/apps/{base}/tables/{t31}"
+                          "/records/batch_update",
+                          {"records": [{"record_id": rid,
+                                        "fields": {plan_link_field: [keep]}}
+                                       for rid in sorted(m["move"])]},
+                          [t31, keep] + sorted(m["move"]))
+            if m["detach"]:
+                api_write("det5x", f"/open-apis/bitable/v1/apps/{base}/tables/{t5x}"
+                          "/records/batch_update",
+                          {"records": [{"record_id": t, "fields": {isa_field: []}}
+                                       for t in sorted(m["detach"])]},
+                          [t5x] + sorted(m["detach"]))
+            if m["delete"]:
+                # batch_delete takes no client_token -> never auto-retried
+                lark._api("POST", f"/open-apis/bitable/v1/apps/{base}/tables/{t5x}"
+                          "/records/batch_delete",
+                          payload={"records": sorted(m["delete"])})
+            _recent_trip_put(m["isa_rec"], plan_table, keep)
+            for r in m["rows"]:
+                r.setdefault("commit", {})["merged"] = keep
+        except Exception as e:
+            for r in m["rows"]:
+                r.setdefault("commit", {})["error"] = f"合并出库计划失败：{e}"
+
+    # ---- Phase 4: 3.1 updates (实际板数 fill + plan link, merged) ----------
+    tick(stage="写入 4/5 · 更新 3.1（实际板数 + 关联出库计划）")
     upd31 = {}             # record_id -> (fields, row)
     for r in rows:
         if (r.get("commit") or {}).get("error"):
@@ -1412,8 +1602,8 @@ def _commit_locked(warehouse, text, approvals, tick, cached_plan=None):
             for _, r in upd31.values():
                 r.setdefault("commit", {})["error"] = f"3.1 更新失败：{e}"
 
-    # ---- Phase 4: 4A mismatch — UPDATE (never create) the linked 5.6 row ---
-    tick(stage="写入 4/4 · 更新预约 ISA/时间（5.6）")
+    # ---- Phase 5: 4A mismatch — UPDATE (never create) the linked 5.6 row ---
+    tick(stage="写入 5/5 · 更新预约 ISA/时间（5.6）")
     upd56 = {}             # isa_record_id -> (fields, [rows])
     for r in rows:
         if (r.get("commit") or {}).get("error"):
@@ -1449,9 +1639,9 @@ def _commit_locked(warehouse, text, approvals, tick, cached_plan=None):
                 for r in rs:
                     r.setdefault("commit", {})["error"] = f"5.6 更新失败：{e}"
 
-    # ---- Phase 5: read-back verification ----------------------------------
+    # ---- Phase 6: read-back verification ----------------------------------
     tick(stage="核实 · 回读校验写入结果")
-    _verify(rows, t31, t56, group_trip_rec, t5x, isa_field)
+    _verify(rows, t31, t56, group_trip_rec, t5x, isa_field, wiring.get("inv_field"))
     tick(stage="完成", current="")
 
     # Roll up the end-of-run warning list the operator asked for.
@@ -1464,7 +1654,8 @@ def _commit_locked(warehouse, text, approvals, tick, cached_plan=None):
     return result
 
 
-def _verify(rows, t31, t56, group_trip_rec, t5x=None, isa_field=None):
+def _verify(rows, t31, t56, group_trip_rec, t5x=None, isa_field=None,
+            inv_field=None):
     """Re-read the records we just wrote and confirm every value landed.
     Marks each committed row verified=True/False with details — the UI shows
     this, and the integration tests assert on it."""
@@ -1486,6 +1677,16 @@ def _verify(rows, t31, t56, group_trip_rec, t5x=None, isa_field=None):
         got = _batch_get(t5x, list(trip_ids), [isa_field])
         trip_links = {tid: lark.link_ids(f.get(isa_field))
                       for tid, f in got.items()}
+    # merged duplicates -> kept trip holds the moved shipments, deleted ones
+    # are gone, detached ones no longer claim the appointment
+    mids = set()
+    for r in rows:
+        if (r.get("commit") or {}).get("merged"):
+            for a in r["actions"]:
+                if a["type"] == "merge_trips":
+                    mids.update([a["keep"], *a["delete"], *a["detach"]])
+    mstate = (_batch_get(t5x, list(mids), [x for x in (isa_field, inv_field) if x])
+              if mids and t5x else {})
     rids56 = set()
     for r in rows:
         c = r.get("commit") or {}
@@ -1530,6 +1731,18 @@ def _verify(rows, t31, t56, group_trip_rec, t5x=None, isa_field=None):
                                    ",".join(got) or "空"))
                 else:
                     checks.append(("出库计划挂预约", bool(c.get("trip_isa_set")), ""))
+            elif a["type"] == "merge_trips":
+                keep_inv = lark.link_ids((mstate.get(a["keep"]) or {}).get(inv_field))
+                n_mv = sum(1 for x in a["move_rows"] if x in keep_inv)
+                n_del = sum(1 for t in a["delete"] if t not in mstate)
+                n_det = sum(1 for t in a["detach"]
+                            if not lark.link_ids((mstate.get(t) or {}).get(isa_field)))
+                ok = (a["keep"] in mstate and n_mv == len(a["move_rows"])
+                      and n_del == len(a["delete"]) and n_det == len(a["detach"]))
+                checks.append(("合并出库计划", ok,
+                               f"保留 {a['keep']}：移入 {n_mv}/{len(a['move_rows'])}"
+                               f"，删除 {n_del}/{len(a['delete'])}"
+                               f"，解除 {n_det}/{len(a['detach'])}"))
         c["done"] = True
         c["verified"] = all(ok for _, ok, _ in checks) if checks else True
         c["checks"] = [{"what": w, "ok": ok, "got": g} for w, ok, g in checks]
