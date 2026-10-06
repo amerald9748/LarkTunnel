@@ -1,6 +1,6 @@
 {
   "name": "lark-tunnel",
-  "version": "0.1.0",
+  "version": "2.1.0",
   "description": "Batch-command tooling and wrapper library for a production Lark (Feishu) Base — warehouse appointment & delivery-plan workflow.",
   "main": "src/lark/index.js",
   "scripts": {

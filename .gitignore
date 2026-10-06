@@ -39,3 +39,6 @@ config/operators-auto.json
 webapp/build/
 webapp/dist/
 webapp/dist_staging/
+
+# Packaged release zips
+release/

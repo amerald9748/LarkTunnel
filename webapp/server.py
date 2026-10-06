@@ -59,7 +59,7 @@ def _live_options(table_id, field_name):
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
 PORT = int(os.environ.get("LARK_PORT", "8787"))
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # Browser heartbeat (GET /api/ping every ~20 s from app.js). The desktop shell
 # uses it to notice that the last window went away when it cannot observe the
